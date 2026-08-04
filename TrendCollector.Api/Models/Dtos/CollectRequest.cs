@@ -1,3 +1,5 @@
+using System.ComponentModel.DataAnnotations;
+
 namespace TrendCollector.Api.Models.Dtos;
 
 /// <summary>
@@ -6,6 +8,7 @@ namespace TrendCollector.Api.Models.Dtos;
 public sealed class CollectRequest
 {
     /// <summary>Search keyword, e.g. "AI".</summary>
+    [Required(AllowEmptyStrings = false)]
     public string Keyword { get; set; } = string.Empty;
 
     /// <summary>Language code, e.g. "id", "en".</summary>
@@ -15,5 +18,6 @@ public sealed class CollectRequest
     public string? Country { get; set; } = "ID";
 
     /// <summary>Maximum number of search results (1-50).</summary>
+    [Range(1, 50)]
     public int MaxResults { get; set; } = 20;
 }
