@@ -1,5 +1,6 @@
 using TrendCollector.Api.Configuration;
 using TrendCollector.Api.Data;
+using TrendCollector.Api.Repositories;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -16,6 +17,12 @@ var connectionString = builder.Configuration.GetConnectionString("Postgres")
 
 builder.Services.AddSingleton(new DbConnectionFactory(connectionString));
 builder.Services.AddScoped<DbInitializer>();
+
+// Repositories
+builder.Services.AddScoped<IPlatformRepository, PlatformRepository>();
+builder.Services.AddScoped<IChannelRepository, ChannelRepository>();
+builder.Services.AddScoped<IVideoRepository, VideoRepository>();
+builder.Services.AddScoped<IJobRepository, JobRepository>();
 
 // Controllers
 builder.Services.AddControllers();
