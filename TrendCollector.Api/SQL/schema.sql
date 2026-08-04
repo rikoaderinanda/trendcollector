@@ -1,0 +1,4 @@
+﻿-- =====================================================================
+-- Trend Collector - Database Schema
+-- Phase 7 will replace this placeholder with the full DDL.
+-- =====================================================================

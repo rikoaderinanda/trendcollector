@@ -1,0 +1,32 @@
+# .NET build artifacts
+bin/
+obj/
+*.user
+
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Rider
+.idea/
+
+# Test results
+TestResults/
+*.trx
+
+# User secrets / local config
+appsettings.Local.json
+*.env
+.env
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+.DS_Store
