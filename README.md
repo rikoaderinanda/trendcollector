@@ -12,10 +12,10 @@ Agent pertama dari platform **AI Content Factory**. Agent ini bertugas mengumpul
 |---|---|---|
 | 1 | Project Structure | ✅ Selesai |
 | 1.5 | Integrasi Database Neon | ✅ Selesai |
-| 2 | Database Design | ⏳ Belum dikerjakan |
-| 3 | Entities | ⏳ Belum dikerjakan |
-| 4 | Repositories | ⏳ Belum dikerjakan |
-| 5 | Services | ⏳ Belum dikerjakan |
+| 2 | Database Design | ✅ Selesai |
+| 3 | Entities | ✅ Selesai |
+| 4 | Repositories | ✅ Selesai |
+| 5 | Services | ✅ Selesai |
 | 6 | Controller | ⏳ Belum dikerjakan |
 | 7 | SQL Script | ⏳ Belum dikerjakan |
 | 8 | Swagger Examples | ⏳ Belum dikerjakan |

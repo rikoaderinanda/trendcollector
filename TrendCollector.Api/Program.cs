@@ -1,15 +1,19 @@
 using TrendCollector.Api.Configuration;
 using TrendCollector.Api.Data;
 using TrendCollector.Api.Repositories;
+using TrendCollector.Api.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Local (non-committed) settings for secrets: appsettings.Local.json
 builder.Configuration.AddJsonFile("appsettings.Local.json", optional: true, reloadOnChange: true);
 
-// Options pattern: ConnectionStrings -> DatabaseOptions
+// Options pattern
 builder.Services.Configure<DatabaseOptions>(
     builder.Configuration.GetSection(DatabaseOptions.SectionName));
+
+builder.Services.Configure<YouTubeOptions>(
+    builder.Configuration.GetSection(YouTubeOptions.SectionName));
 
 // Data access
 var connectionString = builder.Configuration.GetConnectionString("Postgres")
@@ -23,6 +27,11 @@ builder.Services.AddScoped<IPlatformRepository, PlatformRepository>();
 builder.Services.AddScoped<IChannelRepository, ChannelRepository>();
 builder.Services.AddScoped<IVideoRepository, VideoRepository>();
 builder.Services.AddScoped<IJobRepository, JobRepository>();
+
+// Services
+builder.Services.AddHttpClient<IYouTubeApiService, YouTubeApiService>();
+builder.Services.AddScoped<StatisticsCalculator>();
+builder.Services.AddScoped<TrendCollectorService>();
 
 // Controllers
 builder.Services.AddControllers();
