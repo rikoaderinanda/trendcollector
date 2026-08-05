@@ -18,7 +18,7 @@ Agent pertama dari platform **AI Content Factory**. Agent ini bertugas mengumpul
 | 5 | Services | ✅ Selesai |
 | 6 | Controller | ✅ Selesai |
 | 7 | SQL Script | ✅ Selesai |
-| 8 | Swagger Examples | ⏳ Belum dikerjakan |
+| 8 | Swagger Examples | ✅ Selesai |
 | 9 | Testing Guide | ⏳ Belum dikerjakan |
 
 ---

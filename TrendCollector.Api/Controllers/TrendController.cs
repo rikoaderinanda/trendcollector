@@ -1,4 +1,6 @@
 using Microsoft.AspNetCore.Mvc;
+using Swashbuckle.AspNetCore.Annotations;
+using Swashbuckle.AspNetCore.Filters;
 using TrendCollector.Api.Models.Dtos;
 using TrendCollector.Api.Models.Entities;
 using TrendCollector.Api.Repositories;
@@ -36,10 +38,16 @@ public sealed class TrendController : ControllerBase
     /// <response code="200">Collection finished successfully.</response>
     /// <response code="400">Request validation failed.</response>
     [HttpPost("collect")]
+    [SwaggerOperation(
+        Summary = "Collect trending videos",
+        Description = "Searches YouTube for a keyword, fetches full video and channel details, saves them to the database and returns an execution summary.")]
+    [SwaggerRequestExample(typeof(CollectRequest), typeof(CollectRequestExample))]
     [ProducesResponseType(typeof(CollectSummary), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [SwaggerResponseExample(StatusCodes.Status200OK, typeof(CollectSummaryExample))]
     public async Task<ActionResult<CollectSummary>> Collect(
-        [FromBody] CollectRequest request,
+        [FromBody, SwaggerRequestBody("Keyword to search, language and country codes, and the maximum number of results (1-50).", Required = true)]
+        CollectRequest request,
         CancellationToken cancellationToken)
     {
         _logger.LogInformation("Collecting trend for keyword '{Keyword}'", request.Keyword);
@@ -53,6 +61,9 @@ public sealed class TrendController : ControllerBase
     /// <param name="offset">Number of results to skip.</param>
     /// <param name="cancellationToken">Request cancellation token.</param>
     /// <response code="200">Jobs returned.</response>
+    [SwaggerOperation(
+        Summary = "List collection jobs",
+        Description = "Returns the history of trend collection jobs ordered by start time, newest first.")]
     [HttpGet("jobs")]
     [ProducesResponseType(typeof(IEnumerable<CollectionJob>), StatusCodes.Status200OK)]
     public async Task<ActionResult<IEnumerable<CollectionJob>>> GetJobs(
@@ -74,6 +85,9 @@ public sealed class TrendController : ControllerBase
     /// <param name="offset">Number of results to skip.</param>
     /// <param name="cancellationToken">Request cancellation token.</param>
     /// <response code="200">Videos returned.</response>
+    [SwaggerOperation(
+        Summary = "List collected videos",
+        Description = "Returns collected videos, optionally filtered by language, with pagination.")]
     [HttpGet("videos")]
     [ProducesResponseType(typeof(IEnumerable<TrendingVideo>), StatusCodes.Status200OK)]
     public async Task<ActionResult<IEnumerable<TrendingVideo>>> GetVideos(
@@ -96,6 +110,9 @@ public sealed class TrendController : ControllerBase
     /// <param name="cancellationToken">Request cancellation token.</param>
     /// <response code="200">Video found.</response>
     /// <response code="404">Video not found.</response>
+    [SwaggerOperation(
+        Summary = "Get video detail",
+        Description = "Returns a single video with its most recent statistics snapshot.")]
     [HttpGet("videos/{id:long}")]
     [ProducesResponseType(typeof(VideoDetailDto), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status404NotFound)]

@@ -1,3 +1,5 @@
+using System.Reflection;
+using Swashbuckle.AspNetCore.Filters;
 using TrendCollector.Api.Configuration;
 using TrendCollector.Api.Data;
 using TrendCollector.Api.Repositories;
@@ -30,13 +32,33 @@ builder.Services.AddScoped<IJobRepository, JobRepository>();
 
 // Services
 builder.Services.AddHttpClient<IYouTubeApiService, YouTubeApiService>();
+
+// Swagger examples
+builder.Services.AddSwaggerExamplesFromAssemblies(Assembly.GetExecutingAssembly());
 builder.Services.AddScoped<StatisticsCalculator>();
 builder.Services.AddScoped<TrendCollectorService>();
 
 // Controllers
 builder.Services.AddControllers();
 
+// Swagger / OpenAPI
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(options =>
+{
+    var xmlFile = $"{Assembly.GetExecutingAssembly().GetName().Name}.xml";
+    var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
+    options.IncludeXmlComments(xmlPath);
+    options.ExampleFilters();
+});
+
 var app = builder.Build();
+
+// Enable Swagger UI in development
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
 
 // Apply database schema on startup (idempotent SQL)
 await using (var scope = app.Services.CreateAsyncScope())
