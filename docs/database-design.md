@@ -113,6 +113,7 @@ view_per_day    = views / video_age_days
 | `finished_at` | TIMESTAMPTZ | | NULL saat running |
 | `duration_ms` | BIGINT | | |
 | `keyword` | TEXT | NOT NULL | |
+| `mode` | TEXT | NOT NULL DEFAULT `'Discovery'` | `Discovery` / `Tracking` |
 | `country` | TEXT | | |
 | `language` | TEXT | | |
 | `status` | TEXT | NOT NULL | `running` / `completed` / `failed` |
@@ -121,7 +122,7 @@ view_per_day    = views / video_age_days
 | `total_skipped` | INT | NOT NULL DEFAULT 0 | Duplikat / gagal validasi |
 | `error` | TEXT | | |
 
-Index: `started_at DESC`, `keyword`, `status`
+Index: `started_at DESC`, `keyword`, `status`, `mode`
 
 ## 3. Relasi (ER)
 
@@ -147,10 +148,102 @@ collection_jobs (berdiri sendiri - log eksekusi)
 | Duplicate ignore | `UNIQUE(platform_id, platform_video_id)` + `total_skipped` |
 | Platform-agnostic | `platform_id`, `platform_video_id`, `platform_channel_id` |
 
-## 5. Catatan Untuk Future AI Agents
+## 5. Database Bersama Multi-Agent
+
+Semua agent berbagi **satu database** (`neondb`) melalui connection string yang identik di `appsettings.Local.json` masing-masing:
+
+| Agent | Project | Tabel yang dibuat (prefix unik — tidak conflict) |
+|---|---|---|
+| Agent 0 — Trend Discovery | `TrendDiscovery.Api` | `trend_keywords`, `trend_discovery_jobs`, `trend_discovery_prompt_history` |
+| Agent 1 — Trend Collector | `TrendCollector.Api` | `platforms`, `channels`, `trending_videos`, `video_statistics`, `collection_jobs` |
+| Agent 2 — Knowledge Extraction | `KnowledgeExtraction.Api` | `knowledge_extraction_queue`, `video_transcripts`, `video_knowledge`, `video_knowledge_raw` |
+
+> **Urutan startup**: Agent 1 harus lebih dulu (membuat `trending_videos`) karena tabel Agent 2 memiliki FK → `trending_videos(id)`.
+
+## 6. Tabel Agent 2 — Knowledge Extraction
+
+### 6.1 `knowledge_extraction_queue` — Antrian ekstraksi
+
+| Kolom | Tipe | Constraints | Keterangan |
+|---|---|---|---|
+| `id` | BIGSERIAL | PK | |
+| `video_id` | BIGINT | FK → trending_videos.id, UNIQUE NOT NULL | Satu queue per video |
+| `status` | TEXT | NOT NULL DEFAULT 'Pending' | `Pending`/`Running`/`Completed`/`Failed`/`TranscriptUnavailable` |
+| `priority` | INT | NOT NULL DEFAULT 0 | Lebih tinggi diproses dulu |
+| `retry_count` | INT | NOT NULL DEFAULT 0 | Maks 3 (config) |
+| `next_retry_at` | TIMESTAMPTZ | | Exponential backoff: 30s → 60s → 120s |
+| `started_at` | TIMESTAMPTZ | | |
+| `finished_at` | TIMESTAMPTZ | | |
+| `duration_ms` | BIGINT | | |
+| `error_message` | TEXT | | |
+| `created_at` / `updated_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+### 6.2 `video_transcripts` — Transcript video
+
+| Kolom | Tipe | Constraints | Keterangan |
+|---|---|---|---|
+| `id` | BIGSERIAL | PK | |
+| `video_id` | BIGINT | FK → trending_videos.id, UNIQUE NOT NULL | |
+| `transcript` | TEXT | NOT NULL | Teks lengkap subtitle |
+| `language` | TEXT | | `en`, `id`, ... |
+| `source` | TEXT | | `youtube_captions` |
+| `created_at` | TIMESTAMPTZ | NOT NULL DEFAULT now() | |
+
+### 6.3 `video_knowledge` — Knowledge terstruktur (asset reusable AI)
+
+| Kolom | Tipe | Keterangan |
+|---|---|---|
+| `id` | BIGSERIAL | PK |
+| `video_id` | BIGINT | FK → trending_videos.id, UNIQUE (one-to-one) |
+| `summary`, `main_topic` | TEXT | Ringkasan & topik utama |
+| `keywords` | TEXT[] | SEO keywords |
+| `target_audience`, `tone`, `hook` | TEXT | |
+| `content_structure` | TEXT[] | Alur section video |
+| `call_to_action`, `important_points` | TEXT / TEXT[] | |
+| `learning_notes`, `interesting_facts` | TEXT[] | |
+| `psychological_triggers` | TEXT[] | `Curiosity`, `FOMO`, ... |
+| `story_pattern`, `content_type`, `difficulty_level`, `language` | TEXT | |
+| `emotion` | TEXT | Emosi dominan |
+| `curiosity_score`, `educational_value`, `entertainment_value` | INT | Skor 1-100 |
+| `engagement_techniques` | TEXT[] | |
+| `retention_strategy`, `suggested_improvements` | TEXT / TEXT[] | |
+| `created_at` / `updated_at` | TIMESTAMPTZ | |
+
+### 6.4 `video_knowledge_raw` — Audit trail AI (tidak pernah dibuang)
+
+| Kolom | Tipe | Keterangan |
+|---|---|---|
+| `id` | BIGSERIAL | PK |
+| `video_id` | BIGINT | FK → trending_videos.id |
+| `provider`, `model` | TEXT | `OpenAICompatible`, `deepseek-chat` |
+| `prompt` | TEXT | Prompt lengkap yang dikirim |
+| `response` | TEXT | Raw JSON dari AI |
+| `execution_time_ms`, `tokens_input`, `tokens_output` | BIGINT / INT | Telemetry |
+| `created_at` | TIMESTAMPTZ | |
+
+## 7. Relasi ER — v2 (dengan Agent 2)
+
+```
+platforms 1---N channels ---N trending_videos 1---N video_statistics
+                                     │
+                                     │ (video_id FK)
+                                     ├── 1─1 video_transcripts
+                                     ├── 1─1 video_knowledge
+                                     └── 1─N video_knowledge_raw
+                                     │
+                                     └── 1─1 knowledge_extraction_queue
+collection_jobs (berdiri sendiri - log eksekusi)
+trend_keywords / trend_discovery_jobs / trend_discovery_prompt_history (Agent 0 - terpisah)
+```
+
+## 8. Catatan Untuk Future AI Agents
 
 - **Transcript Collector**: `trending_videos.id` + `caption_available` → tahu video mana yang punya caption
 - **Viral Analyzer**: `video_statistics` (snapshot historis + metrik) → deteksi growth
 - **Thumbnail Analyzer**: `thumbnail_*_url` kolom langsung + `raw_json`
 - **Audience Analyzer**: `language`, `country` (dari job) + `channel.country`
 - **Script/Storyboard/Prompt Generator**: `description`, `tags`, `raw_json`
+- **Agent 3+ (Content Generator)**: konsumsi `video_knowledge` — JANGAN baca raw metadata langsung
+- **Agent 3+ (Virality Predictor)**: konsumsi `video_knowledge` (curiosity_score, psychological_triggers) + `video_statistics`
+- **Agent 3+ (Script Writer)**: konsumsi `video_knowledge` (contentStructure, hook, storyPattern, learningNotes)
+- **Debug/audit**: `video_knowledge_raw` menyimpan prompt + response AI mentah untuk tracing
