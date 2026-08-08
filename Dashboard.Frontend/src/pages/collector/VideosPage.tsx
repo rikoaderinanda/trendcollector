@@ -53,6 +53,12 @@ export default function VideosPage() {
   const [limit, setLimit] = useState(20);
   const [offset, setOffset] = useState(0);
 
+  // Keep the local date filter state in sync with the URL query param
+  // (e.g. when navigating from the Workflow page while already on this page).
+  useEffect(() => {
+    setDateFilter(dateParam);
+  }, [dateParam]);
+
   // Pass the date filter to the backend so pagination happens server-side.
   // Reset to the first page whenever the date filter changes.
   useEffect(() => {
