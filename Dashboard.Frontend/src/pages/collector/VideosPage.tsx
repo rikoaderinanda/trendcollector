@@ -48,6 +48,7 @@ function VideoCard({ video }: { video: TrendingVideo }) {
 export default function VideosPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const dateParam = searchParams.get('date') ?? '';
+  const [dateFilter, setDateFilter] = useState(dateParam);
   const [language, setLanguage] = useState('');
   const [limit, setLimit] = useState(20);
   const [offset, setOffset] = useState(0);
@@ -56,14 +57,25 @@ export default function VideosPage() {
   // Reset to the first page whenever the date filter changes.
   useEffect(() => {
     setOffset(0);
-  }, [dateParam]);
+  }, [dateFilter]);
 
   const videosQuery = useVideos({
     language,
-    date: dateParam || undefined,
+    date: dateFilter || undefined,
     limit: Math.min(limit, 100),
     offset,
   });
+
+  const handleDateChange = (value: string) => {
+    setDateFilter(value);
+    setSearchParams(value ? { date: value } : {});
+  };
+
+  const clearDateFilter = () => {
+    setDateFilter('');
+    setSearchParams({});
+  };
+
   const videos = videosQuery.data ?? [];
   const filteredVideos = videos;
   const paginatedVideos = filteredVideos;
@@ -75,10 +87,6 @@ export default function VideosPage() {
     return <LoadingSpinner text="Loading videos..." />;
   }
 
-  const clearDateFilter = () => {
-    setSearchParams({});
-  };
-
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -86,7 +94,13 @@ export default function VideosPage() {
           <h1 className="text-2xl font-bold text-gray-900">Collected Videos</h1>
           <p className="text-sm text-gray-500 mt-1">Videos collected by TrendCollector API</p>
         </div>
-        <div className="flex gap-3">
+        <div className="flex flex-wrap items-center gap-3">
+          <input
+            type="date"
+            className="input-field w-40"
+            value={dateFilter}
+            onChange={(e) => handleDateChange(e.target.value)}
+          />
           <input
             className="input-field w-32"
             placeholder="Language..."
@@ -105,10 +119,10 @@ export default function VideosPage() {
         </div>
       </div>
 
-      {dateParam && (
+      {dateFilter && (
         <div className="flex items-center justify-between bg-indigo-50 border border-indigo-200 rounded-lg px-4 py-2 text-sm">
           <span className="text-indigo-700">
-            🔎 Showing {filteredVideos.length} video(s) collected on <strong>{dateParam}</strong>
+            🔎 Showing {filteredVideos.length} video(s) collected on <strong>{dateFilter}</strong>
           </span>
           <button className="text-indigo-600 font-medium hover:underline" onClick={clearDateFilter}>
             Clear date filter (show all)
@@ -118,8 +132,8 @@ export default function VideosPage() {
 
       {paginatedVideos.length === 0 ? (
         <div className="card p-8 text-center text-gray-500 text-sm">
-          {dateParam
-            ? `No videos collected on ${dateParam}.`
+          {dateFilter
+            ? `No videos collected on ${dateFilter}.`
             : 'No videos collected yet. Run a collection job to gather videos.'}
         </div>
       ) : (
