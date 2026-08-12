@@ -1,4 +1,5 @@
-﻿using AIContentFactory.Api.Models.Entities;
+﻿using AIContentFactory.Api.Models;
+using AIContentFactory.Api.Models.Entities;
 
 namespace AIContentFactory.Api.Repositories;
 
@@ -17,7 +18,8 @@ public interface IVideoRepository
     Task InsertStatisticsAsync(VideoStatistics statistics, CancellationToken cancellationToken = default);
 
     /// <summary>Inserts a video together with its first statistics snapshot in one transaction.</summary>
-    Task<long> InsertWithStatisticsAsync(TrendingVideo video, VideoStatistics statistics, CancellationToken cancellationToken = default);
+    Task<long> InsertWithStatisticsAsync(TrendingVideo video, VideoStatistics statistics,
+        CancellationToken cancellationToken = default);
 
     /// <summary>Gets a video by its internal id, or null when not found.</summary>
     Task<TrendingVideo?> GetByIdAsync(long id, CancellationToken cancellationToken = default);
@@ -28,8 +30,23 @@ public interface IVideoRepository
     /// <summary>
     /// Lists videos with optional language filter, optional calendar date filter (started/created day), and pagination.
     /// </summary>
-    Task<IEnumerable<TrendingVideo>> ListAsync(string? language, DateTime? date, int limit, int offset, CancellationToken cancellationToken = default);
+    Task<IEnumerable<TrendingVideo>> ListAsync(string? language, DateTime? date, int limit, int offset,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Lists videos paired with their most recent statistics snapshot.
+    /// Supports optional statistics range filters and sorting via <see cref="VideoListQuery"/>.
+    /// </summary>
+    Task<IEnumerable<AIContentFactory.Api.Models.Dtos.VideoListItemDto>> ListWithLatestStatsAsync(
+        VideoListQuery query, CancellationToken cancellationToken = default);
 
     /// <summary>Lists videos collected within the last <paramref name="days"/> days (by created_at).</summary>
     Task<IEnumerable<TrendingVideo>> ListRecentAsync(int days, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Gets the full statistics history of a video (all snapshots, oldest first).
+    /// Used by the Viral Analyzer to compute velocity and momentum evidence.
+    /// </summary>
+    Task<IEnumerable<VideoStatistics>> GetStatisticsHistoryAsync(long videoId,
+        CancellationToken cancellationToken = default);
 }

@@ -6,7 +6,9 @@ import {
   PolarAngleAxis,
 } from 'recharts';
 import { useVideoDetail } from '../../hooks/useCollector';
+import { useKnowledgeExtractionDetail } from '../../hooks/useKnowledgeExtraction';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import StatusBadge from '../../components/StatusBadge';
 import {
   formatDateTime,
   formatNumber,
@@ -51,6 +53,10 @@ export default function VideoDetailPage() {
   const videoId = Number(id);
 
   const { data, isLoading, isError } = useVideoDetail(videoId);
+  const knowledgeQuery = useKnowledgeExtractionDetail(videoId);
+  const knowledgeData = knowledgeQuery.data;
+  const knowledge = knowledgeData?.knowledge;
+  const queue = knowledgeData?.queue;
 
   if (isLoading) {
     return <LoadingSpinner text="Loading video detail..." />;
@@ -242,6 +248,123 @@ export default function VideoDetailPage() {
           </div>
         </div>
       )}
+
+      {/* Knowledge Extraction section */}
+      <div className="card p-5">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-gray-900">🧠 Knowledge Extraction</h2>
+          <Link
+            to={`/knowledge-extraction/video/${video.id}`}
+            className="text-sm text-primary-600 hover:text-primary-700 hover:underline"
+          >
+            View full detail →
+          </Link>
+        </div>
+
+        {knowledgeQuery.isLoading ? (
+          <LoadingSpinner text="Loading knowledge..." />
+        ) : (
+          <>
+            {/* Queue status */}
+            <div className="flex items-center gap-4 mb-4">
+              <span className="text-xs text-gray-500 uppercase tracking-wide">Queue Status</span>
+              {queue ? (
+                <>
+                  <StatusBadge status={queue.status} />
+                  <span className="text-xs text-gray-500">retry {queue.retryCount}</span>
+                </>
+              ) : (
+                <span className="text-xs text-gray-400">Not queued / no extraction attempt yet</span>
+              )}
+            </div>
+
+            {knowledge ? (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="md:col-span-2">
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Summary</p>
+                  <p className="text-sm text-gray-800 mt-0.5 line-clamp-3">{knowledge.summary ?? '-'}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Main Topic</p>
+                  <p className="text-sm text-gray-800 mt-0.5">{knowledge.mainTopic ?? '-'}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Content Type</p>
+                  <p className="text-sm text-gray-800 mt-0.5">{knowledge.contentType ?? '-'}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Hook</p>
+                  <p className="text-sm text-gray-800 mt-0.5 line-clamp-2">{knowledge.hook ?? '-'}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Emotion / Tone</p>
+                  <p className="text-sm text-gray-800 mt-0.5">
+                    {[knowledge.emotion, knowledge.tone].filter(Boolean).join(' · ') || '-'}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Call To Action</p>
+                  <p className="text-sm text-gray-800 mt-0.5">{knowledge.callToAction ?? '-'}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 uppercase tracking-wide">Target Audience</p>
+                  <p className="text-sm text-gray-800 mt-0.5">{knowledge.targetAudience ?? '-'}</p>
+                </div>
+
+                {knowledge.keywords && knowledge.keywords.length > 0 && (
+                  <div className="md:col-span-2">
+                    <p className="text-xs text-gray-400 uppercase tracking-wide">Keywords</p>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {knowledge.keywords.slice(0, 15).map((kw) => (
+                        <span key={kw} className="bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded">
+                          {kw}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {knowledge.psychologicalTriggers && knowledge.psychologicalTriggers.length > 0 && (
+                  <div className="md:col-span-1">
+                    <p className="text-xs text-gray-400 uppercase tracking-wide">Psychological Triggers</p>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {knowledge.psychologicalTriggers.slice(0, 8).map((item) => (
+                        <span key={item} className="bg-purple-50 text-purple-700 text-xs px-2 py-1 rounded">
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {knowledge.contentStructure && knowledge.contentStructure.length > 0 && (
+                  <div className="md:col-span-1">
+                    <p className="text-xs text-gray-400 uppercase tracking-wide">Content Structure</p>
+                    <div className="flex flex-wrap gap-1.5 mt-1">
+                      {knowledge.contentStructure.slice(0, 8).map((item) => (
+                        <span key={item} className="bg-blue-50 text-blue-700 text-xs px-2 py-1 rounded">
+                          {item}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="bg-gray-50 rounded-lg p-4 text-sm text-gray-500">
+                {queue ? (
+                  <>
+                    Knowledge extraction has not produced structured data yet
+                    {queue.status === 'TranscriptUnavailable' && ' (transcript unavailable)'}.
+                  </>
+                ) : (
+                  'This video has not been processed by Agent 2 (Knowledge Extraction) yet.'
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
   );
 }

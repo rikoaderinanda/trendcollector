@@ -25,6 +25,11 @@ public sealed class DataRetentionBackgroundService : BackgroundService
     /// <summary>Number of days of video_statistics snapshots to keep (beyond latest).</summary>
     private static readonly TimeSpan StatisticsRetentionWindow = TimeSpan.FromDays(30);
 
+    /// <summary>Number of days of viral_analysis_runs history to keep.
+    /// Child tables (opportunities, patterns, prompt history, candidate snapshots)
+    /// are removed automatically via ON DELETE CASCADE.</summary>
+    private static readonly TimeSpan ViralAnalysisRetentionWindow = TimeSpan.FromDays(90);
+
     public DataRetentionBackgroundService(
         IServiceScopeFactory scopeFactory,
         IOptions<TrackingModeOptions> trackingOptions,
@@ -123,11 +128,24 @@ public sealed class DataRetentionBackgroundService : BackgroundService
             new { Cutoff = statsCutoff },
             commandTimeout: 120);
 
-        if (deletedJobs > 0 || deletedStats > 0)
+        // 3. Remove old viral_analysis_runs (Agent 3). Child tables are
+        //    removed automatically via ON DELETE CASCADE.
+        const string deleteViralSql = """
+                                      DELETE FROM viral_analysis_runs
+                                      WHERE started_at < @Cutoff;
+                                      """;
+
+        var viralCutoff = DateTime.UtcNow - ViralAnalysisRetentionWindow;
+        var deletedViralRuns = await connection.ExecuteAsync(
+            deleteViralSql,
+            new { Cutoff = viralCutoff },
+            commandTimeout: 120);
+
+        if (deletedJobs > 0 || deletedStats > 0 || deletedViralRuns > 0)
         {
             _logger.LogInformation(
-                "Data retention sweep: deleted {Jobs} old collection_jobs and {Stats} old statistics snapshots.",
-                deletedJobs, deletedStats);
+                "Data retention sweep: deleted {Jobs} old collection_jobs, {Stats} old statistics snapshots and {ViralRuns} old viral analysis runs.",
+                deletedJobs, deletedStats, deletedViralRuns);
         }
         else
         {

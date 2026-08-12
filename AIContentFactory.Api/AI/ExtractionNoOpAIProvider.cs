@@ -35,4 +35,23 @@ public sealed class ExtractionNoOpAIProvider : IKnowledgeExtractionProvider
             Success = true
         });
     }
+
+    public Task<TranscriptPolishResponse> PolishTranscriptAsync(
+        string transcript,
+        string? language,
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogWarning(
+            "ExtractionNoOpAIProvider is active. Transcript polishing skipped (no AI configured).");
+
+        return Task.FromResult(new TranscriptPolishResponse
+        {
+            PolishedText = transcript,
+            Score = 0,
+            Provider = ProviderName,
+            Model = ModelName,
+            Success = false,
+            ErrorMessage = "NoOp provider - transcript polishing disabled."
+        });
+    }
 }

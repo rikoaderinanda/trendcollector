@@ -13,21 +13,25 @@ public sealed class YouTubeApiService : IYouTubeApiService
     private readonly YouTubeOptions _options;
     private readonly IQuotaTracker _quotaTracker;
     private readonly ILogger<YouTubeApiService> _logger;
+    private readonly TrendCollectorOptions _collectorOptions;
 
     private const int BatchSize = 50;
 
-    /// <summary>Maximum retry attempts for transient YouTube API errors (5xx, network blips).</summary>
-    private const int MaxTransientRetries = 3;
+    private readonly RetryCalculator _retryCalculator;
 
     public YouTubeApiService(
         HttpClient httpClient,
         IOptions<YouTubeOptions> options,
+        IOptions<TrendCollectorOptions> collectorOptions,
         IQuotaTracker quotaTracker,
+        RetryCalculator retryCalculator,
         ILogger<YouTubeApiService> logger)
     {
         _httpClient = httpClient;
         _options = options.Value;
+        _collectorOptions = collectorOptions.Value;
         _quotaTracker = quotaTracker;
+        _retryCalculator = retryCalculator;
         _logger = logger;
     }
 
@@ -42,17 +46,49 @@ public sealed class YouTubeApiService : IYouTubeApiService
         // This counter is the source of truth for switching to Tracking Mode.
         await _quotaTracker.IncrementSearchCallCountAsync(cancellationToken);
 
-        var query = BuildQuery(
+        var queryParams = new List<(string Key, string? Value)>
+        {
             ("part", "snippet"),
             ("type", "video"),
             ("q", keyword),
             ("relevanceLanguage", language),
             ("regionCode", country),
             ("maxResults", maxResults.ToString()),
-            ("key", _options.ApiKey));
+            ("key", _options.ApiKey)
+        };
 
-        _logger.LogInformation("Searching YouTube videos for keyword '{Keyword}' (language={Language}, country={Country}, max={Max})",
-            keyword, language, country, maxResults);
+        // Recent-shorts discovery: order by date to bias toward fresh videos.
+        if (!string.IsNullOrWhiteSpace(_collectorOptions.SearchOrder))
+        {
+            queryParams.Add(("order", _collectorOptions.SearchOrder));
+        }
+
+        // Biase toward short-form videos (YouTube's "short" = ≤4 min).
+        if (!string.IsNullOrWhiteSpace(_collectorOptions.SearchVideoDuration))
+        {
+            queryParams.Add(("videoDuration", _collectorOptions.SearchVideoDuration));
+        }
+
+        // Only include videos published within the configured freshness window.
+        if (_collectorOptions.SearchWindowDays > 0)
+        {
+            var publishedAfter = DateTime.UtcNow
+                .AddDays(-_collectorOptions.SearchWindowDays)
+                .ToString("yyyy-MM-ddTHH:mm:ssZ");
+            queryParams.Add(("publishedAfter", publishedAfter));
+        }
+
+        var query = BuildQuery(queryParams.ToArray());
+
+        _logger.LogInformation(
+            "Trend search: keyword={Keyword}, order={Order}, videoDuration={Duration}, publishedAfter={PublishedAfter}, maxResults={Max}",
+            keyword,
+            _collectorOptions.SearchOrder,
+            _collectorOptions.SearchVideoDuration,
+            _collectorOptions.SearchWindowDays > 0
+                ? DateTime.UtcNow.AddDays(-_collectorOptions.SearchWindowDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
+                : "(none)",
+            maxResults);
 
         return await GetAsync(_options.SearchEndpoint, query, cancellationToken);
     }
@@ -188,15 +224,14 @@ public sealed class YouTubeApiService : IYouTubeApiService
         var url = $"{endpoint}?{query}";
         Exception? lastException = null;
 
-        for (var attempt = 0; attempt <= MaxTransientRetries; attempt++)
+        for (var attempt = 0; _retryCalculator.ShouldRetry(attempt - 1) || attempt == 0; attempt++)
         {
             if (attempt > 0)
             {
-                // Exponential backoff: 1s → 2s → 4s between retries.
-                var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt - 1));
+                var delay = _retryCalculator.Calculate(attempt - 1);
                 _logger.LogWarning(
-                    "Retrying YouTube API call after {Seconds}s (attempt {Attempt}/{Max}). Endpoint: {Endpoint}",
-                    delay.TotalSeconds, attempt, MaxTransientRetries, endpoint);
+                    "Retrying YouTube API call after {Seconds:0}s (attempt {Attempt}). Endpoint: {Endpoint}",
+                    delay.TotalSeconds, attempt, endpoint);
                 await Task.Delay(delay, cancellationToken);
             }
 
@@ -209,8 +244,8 @@ public sealed class YouTubeApiService : IYouTubeApiService
                     var body = await response.Content.ReadAsStringAsync(cancellationToken);
                     var error = MapHttpError(response.StatusCode, endpoint, body);
 
-                    // Only retry transient errors (5xx / network blips).
-                    if (error is YouTubeTransientException && attempt < MaxTransientRetries)
+                    // Only retry transient errors.
+                    if (error is YouTubeTransientException && _retryCalculator.ShouldRetry(attempt))
                     {
                         lastException = error;
                         continue;
@@ -224,10 +259,9 @@ public sealed class YouTubeApiService : IYouTubeApiService
             }
             catch (HttpRequestException ex)
             {
-                // Network-level failures (connection reset, timeout, DNS…) are transient.
                 lastException = new YouTubeTransientException($"Network error calling {endpoint}: {ex.Message}", ex);
 
-                if (attempt < MaxTransientRetries)
+                if (_retryCalculator.ShouldRetry(attempt))
                 {
                     continue;
                 }
@@ -236,7 +270,7 @@ public sealed class YouTubeApiService : IYouTubeApiService
             }
         }
 
-        throw lastException ?? new YouTubeTransientException($"YouTube API call failed after {MaxTransientRetries + 1} attempts: {endpoint}");
+        throw lastException ?? new YouTubeTransientException($"YouTube API call failed: {endpoint}");
     }
 
     /// <summary>

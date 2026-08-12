@@ -20,4 +20,11 @@
     <None Include="SQL\schema.sql" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The yt-dlp executable used by the transcript fallback provider.
+         Copied to the output directory so the app can find it at runtime
+         even when run from a published location. -->
+    <None Include="tools\yt-dlp.exe" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

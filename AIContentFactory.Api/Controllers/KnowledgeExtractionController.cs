@@ -1,7 +1,9 @@
-﻿using AIContentFactory.Api.Models.Dtos;
+﻿using AIContentFactory.Api.AI;
+using AIContentFactory.Api.Models.Dtos;
 using AIContentFactory.Api.Models.Entities;
 using AIContentFactory.Api.Repositories;
 using AIContentFactory.Api.Services;
+using AIContentFactory.Api.Transcript;
 using Microsoft.AspNetCore.Mvc;
 using Swashbuckle.AspNetCore.Annotations;
 using Swashbuckle.AspNetCore.Filters;
@@ -20,6 +22,8 @@ public sealed class KnowledgeExtractionController : ControllerBase
     private readonly IVideoMetadataRepository _videoMetadataRepository;
     private readonly IVideoTranscriptRepository _transcriptRepository;
     private readonly IVideoKnowledgeRepository _knowledgeRepository;
+    private readonly YtDlpTranscriptProvider _transcriptProvider;
+    private readonly IKnowledgeExtractionProvider _aiProvider;
     private readonly ILogger<KnowledgeExtractionController> _logger;
 
     public KnowledgeExtractionController(
@@ -28,6 +32,8 @@ public sealed class KnowledgeExtractionController : ControllerBase
         IVideoMetadataRepository videoMetadataRepository,
         IVideoTranscriptRepository transcriptRepository,
         IVideoKnowledgeRepository knowledgeRepository,
+        YtDlpTranscriptProvider transcriptProvider,
+        IKnowledgeExtractionProvider aiProvider,
         ILogger<KnowledgeExtractionController> logger)
     {
         _queueService = queueService;
@@ -35,6 +41,8 @@ public sealed class KnowledgeExtractionController : ControllerBase
         _videoMetadataRepository = videoMetadataRepository;
         _transcriptRepository = transcriptRepository;
         _knowledgeRepository = knowledgeRepository;
+        _transcriptProvider = transcriptProvider;
+        _aiProvider = aiProvider;
         _logger = logger;
     }
 
@@ -185,14 +193,16 @@ public sealed class KnowledgeExtractionController : ControllerBase
                 "Manual knowledge extraction failed for video {VideoId}, queue {QueueId}.",
                 videoId, queueItem.Id);
 
-            await _queueService.MarkAttemptFailedAsync(queueItem.Id, ex.Message, cancellationToken);
+            var willRetry = await _queueService.MarkAttemptFailedAsync(
+                queueItem.Id, ex.Message, cancellationToken);
+            var updated = await _queueService.GetByIdAsync(queueItem.Id, cancellationToken);
 
             return Ok(new RunKnowledgeExtractionResponse
             {
                 QueueId = queueItem.Id,
                 VideoId = videoId,
-                Status = "Failed",
-                RetryCount = 0,
+                Status = (willRetry ? "Retrying" : "Failed"),
+                RetryCount = updated?.RetryCount ?? 0,
                 ErrorMessage = ex.Message,
                 StartedAt = startedAt,
                 FinishedAt = DateTimeOffset.UtcNow
@@ -251,19 +261,96 @@ public sealed class KnowledgeExtractionController : ControllerBase
                 "Manual retry failed for knowledge extraction queue {QueueId} (video {VideoId}).",
                 queueId, queueItem.VideoId);
 
-            await _queueService.MarkAttemptFailedAsync(queueId, ex.Message, cancellationToken);
+            var willRetry = await _queueService.MarkAttemptFailedAsync(
+                queueId, ex.Message, cancellationToken);
+            var updated = await _queueService.GetByIdAsync(queueId, cancellationToken);
 
             return Ok(new RunKnowledgeExtractionResponse
             {
                 QueueId = queueId,
                 VideoId = queueItem.VideoId,
-                Status = "Failed",
-                RetryCount = 0,
+                Status = (willRetry ? "Retrying" : "Failed"),
+                RetryCount = updated?.RetryCount ?? 0,
                 ErrorMessage = ex.Message,
                 StartedAt = startedAt,
                 FinishedAt = DateTimeOffset.UtcNow
             });
         }
+    }
+
+    /// <summary>
+    /// Reconstructs an existing stored transcript using the latest normalization
+    /// pipeline (removes consecutive duplicate phrases from YouTube ASR captions).
+    /// Reads the current transcript, applies NormalizeTranscriptText and upserts
+    /// the cleaned version. Returns before/after lengths so the UI can show the
+    /// reduction in duplicated text.
+    /// </summary>
+    [HttpPost("retranscript/{videoId:long}")]
+    [SwaggerOperation(
+        Summary = "Reconstruct transcript with new normalization",
+        Description =
+            "Applies the latest dedup normalization to an already stored transcript, without re-fetching from YouTube.")]
+    [ProducesResponseType(typeof(RetryTranscriptUnavailableResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<RetryTranscriptUnavailableResponse>> ReconstructTranscript(
+        [FromRoute] long videoId,
+        CancellationToken cancellationToken = default)
+    {
+        var transcript = await _transcriptRepository.GetByVideoIdAsync(videoId, cancellationToken);
+        if (transcript is null)
+        {
+            return NotFound();
+        }
+
+        var beforeLength = transcript.Transcript?.Length ?? 0;
+
+        // 1. Deterministic dedup (removes ASR stutter / repeated n-grams).
+        var deduped = YtDlpTranscriptProvider.NormalizeTranscriptText(transcript.Transcript ?? string.Empty);
+
+        // 2. AI polish: fix grammar, remove filler, add paragraphs, score quality.
+        var polished = await _aiProvider.PolishTranscriptAsync(deduped, transcript.Language, cancellationToken);
+
+        var finalText = polished.Success && !string.IsNullOrWhiteSpace(polished.PolishedText)
+            ? polished.PolishedText
+            : deduped;
+
+        transcript.Transcript = finalText;
+        transcript.TranscriptScore = polished.Score;
+        await _transcriptRepository.UpsertAsync(transcript, cancellationToken);
+
+        _logger.LogInformation(
+            "Reconstructed + polished transcript for video {VideoId}: {Before} chars -> {After} chars, AI score {Score}.",
+            videoId, beforeLength, finalText.Length, polished.Score);
+
+        return Ok(new RetryTranscriptUnavailableResponse { ResetCount = 1 });
+    }
+
+    /// <summary>
+    /// Resets all jobs in the terminal TranscriptUnavailable state back to
+    /// Pending so the background worker can retry them. Useful after enabling a
+    /// transcript fallback provider (e.g. yt-dlp).
+    /// </summary>
+    /// <param name="cancellationToken">Request cancellation token.</param>
+    /// <response code="200">The number of queue items reset is returned.</response>
+    [SwaggerOperation(
+        Summary = "Retry all TranscriptUnavailable jobs",
+        Description =
+            "Resets every queue item with the terminal TranscriptUnavailable status back to Pending. The background worker will reprocess them automatically.")]
+    [HttpPost("retry-transcript-unavailable")]
+    [ProducesResponseType(typeof(RetryTranscriptUnavailableResponse), StatusCodes.Status200OK)]
+    public async Task<ActionResult<RetryTranscriptUnavailableResponse>> RetryAllTranscriptUnavailable(
+        CancellationToken cancellationToken = default)
+    {
+        var resetCount = await _queueService.ResetAllTranscriptUnavailableAsync(cancellationToken);
+
+        _logger.LogInformation(
+            "Reset {ResetCount} TranscriptUnavailable knowledge extraction job(s) back to Pending.",
+            resetCount);
+
+        return Ok(new RetryTranscriptUnavailableResponse
+        {
+            ResetCount = resetCount
+        });
     }
 
     private static KnowledgeExtractionJobDto MapJob(KnowledgeExtractionQueue item)
@@ -280,6 +367,7 @@ public sealed class KnowledgeExtractionController : ControllerBase
             FinishedAt = item.FinishedAt,
             DurationMs = item.DurationMs,
             ErrorMessage = item.ErrorMessage,
+            TranscriptScore = item.TranscriptScore,
             CreatedAt = item.CreatedAt,
             UpdatedAt = item.UpdatedAt
         };

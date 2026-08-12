@@ -11,7 +11,54 @@ export interface VideoFilters {
   date?: string;
   limit?: number;
   offset?: number;
+
+  // Sorting
+  sortBy?: SortMetric;
+  sortDirection?: "asc" | "desc";
+
+  // Statistics filter ranges (latest snapshot)
+  minViews?: number;
+  maxViews?: number;
+  minLikes?: number;
+  maxLikes?: number;
+  minComments?: number;
+  maxComments?: number;
+  minFavorites?: number;
+  maxFavorites?: number;
+  minEngagementRate?: number;
+  maxEngagementRate?: number;
+  minViewPerDay?: number;
+  maxViewPerDay?: number;
+  minVideoAgeDays?: number;
+  maxVideoAgeDays?: number;
+  capturedAfter?: string;
+  capturedBefore?: string;
+
+  // Tracking Mode velocity metrics
+  minViewsPerHour?: number;
+  maxViewsPerHour?: number;
+  minLikeVelocity?: number;
+  maxLikeVelocity?: number;
+  minCommentVelocity?: number;
+  maxCommentVelocity?: number;
+  minGrowthScore?: number;
+  maxGrowthScore?: number;
 }
+
+export type SortMetric =
+  | "published_at"
+  | "views"
+  | "likes"
+  | "comments"
+  | "favorites"
+  | "engagement_rate"
+  | "view_per_day"
+  | "video_age_days"
+  | "captured_at"
+  | "views_per_hour"
+  | "like_velocity"
+  | "comment_velocity"
+  | "growth_score";
 
 export interface JobsFilters {
   date?: string;

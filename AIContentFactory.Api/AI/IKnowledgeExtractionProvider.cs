@@ -18,4 +18,13 @@ public interface IKnowledgeExtractionProvider
     Task<KnowledgeExtractionResponse> ExtractAsync(
         KnowledgeExtractionRequest request,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Sends a transcript for AI polishing (fix grammar, remove filler words,
+    /// add paragraph breaks) and returns the polished text plus a quality score.
+    /// </summary>
+    Task<TranscriptPolishResponse> PolishTranscriptAsync(
+        string transcript,
+        string? language,
+        CancellationToken cancellationToken = default);
 }

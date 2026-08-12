@@ -119,14 +119,16 @@ CREATE TABLE IF NOT EXISTS collection_jobs (
     error            TEXT
 );
 
+-- Migration safety: adds the mode column when the table already existed
+-- without it. IMPORTANT: this ALTER must run BEFORE any index on `mode`,
+-- otherwise the batch aborts on old databases and the column never gets added.
+ALTER TABLE collection_jobs
+    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'Discovery';
+
 CREATE INDEX IF NOT EXISTS idx_collection_jobs_started_at ON collection_jobs (started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_collection_jobs_keyword    ON collection_jobs (keyword);
 CREATE INDEX IF NOT EXISTS idx_collection_jobs_status     ON collection_jobs (status);
 CREATE INDEX IF NOT EXISTS idx_collection_jobs_mode       ON collection_jobs (mode);
-
--- Migration safety: adds the mode column when the table already existed without it.
-ALTER TABLE collection_jobs
-    ADD COLUMN IF NOT EXISTS mode TEXT NOT NULL DEFAULT 'Discovery';
 
 -- ---------------------------------------------------------------------
 -- 6. daily_api_usage
@@ -240,11 +242,14 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_extraction_status  ON knowledge_extract
 CREATE INDEX IF NOT EXISTS idx_knowledge_extraction_priority ON knowledge_extraction_queue (priority DESC);
 CREATE INDEX IF NOT EXISTS idx_knowledge_extraction_video_id ON knowledge_extraction_queue (video_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_extraction_created  ON knowledge_extraction_queue (created_at);
-CREATE INDEX IF NOT EXISTS idx_knowledge_extraction_next_retry ON knowledge_extraction_queue (next_retry_at);
 
--- Migration safety: adds next_retry_at when the table already existed without it.
+-- Migration safety: adds next_retry_at when the table already existed
+-- without it. Must run BEFORE the index on next_retry_at (same reason as
+-- the collection_jobs.mode migration above).
 ALTER TABLE knowledge_extraction_queue
     ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_knowledge_extraction_next_retry ON knowledge_extraction_queue (next_retry_at);
 
 -- ---------------------------------------------------------------------
 -- 12. video_transcripts (Agent 2)
@@ -258,6 +263,9 @@ CREATE TABLE IF NOT EXISTS video_transcripts (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT uq_video_transcripts_video UNIQUE (video_id)
 );
+
+ALTER TABLE video_transcripts
+    ADD COLUMN IF NOT EXISTS transcript_score INT;
 
 CREATE INDEX IF NOT EXISTS idx_video_transcripts_video_id ON video_transcripts (video_id);
 
@@ -317,3 +325,159 @@ CREATE TABLE IF NOT EXISTS video_knowledge_raw (
 );
 
 CREATE INDEX IF NOT EXISTS idx_video_knowledge_raw_video_id ON video_knowledge_raw (video_id);
+
+-- ---------------------------------------------------------------------
+-- 15. viral_analysis_runs (Agent 3: Viral Analyzer)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS viral_analysis_runs (
+    id                        BIGSERIAL PRIMARY KEY,
+    started_at                TIMESTAMPTZ NOT NULL,
+    finished_at               TIMESTAMPTZ,
+    status                    TEXT NOT NULL DEFAULT 'Running',
+    niche                     TEXT,
+    trend_keyword             TEXT,
+    date_from                 DATE,
+    date_to                   DATE,
+    total_candidates          INT NOT NULL DEFAULT 0,
+    eligible_candidates       INT NOT NULL DEFAULT 0,
+    opportunities_generated   INT NOT NULL DEFAULT 0,
+    recommended_opportunity_id BIGINT,
+    trend_summary             TEXT,
+    market_observation        TEXT,
+    confidence_score          NUMERIC(5,2),
+    analysis_version          TEXT,
+    error_message             TEXT,
+    created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_viral_analysis_runs_recommendation UNIQUE (recommended_opportunity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_viral_analysis_runs_status     ON viral_analysis_runs (status);
+CREATE INDEX IF NOT EXISTS idx_viral_analysis_runs_started_at ON viral_analysis_runs (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_viral_analysis_runs_niche      ON viral_analysis_runs (niche);
+CREATE INDEX IF NOT EXISTS idx_viral_analysis_runs_keyword    ON viral_analysis_runs (trend_keyword);
+
+-- ---------------------------------------------------------------------
+-- 16. viral_analysis_winning_patterns (Agent 3)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS viral_analysis_winning_patterns (
+    id                      BIGSERIAL PRIMARY KEY,
+    analysis_run_id         BIGINT NOT NULL REFERENCES viral_analysis_runs (id) ON DELETE CASCADE,
+    pattern_type            TEXT NOT NULL,
+    pattern_name            TEXT NOT NULL,
+    description             TEXT NOT NULL,
+    frequency               INT NOT NULL DEFAULT 0,
+    supporting_video_count  INT NOT NULL DEFAULT 0,
+    average_momentum_score  NUMERIC(6,2),
+    evidence                TEXT,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_viral_patterns_run_id    ON viral_analysis_winning_patterns (analysis_run_id);
+CREATE INDEX IF NOT EXISTS idx_viral_patterns_type      ON viral_analysis_winning_patterns (pattern_type);
+CREATE INDEX IF NOT EXISTS idx_viral_patterns_name      ON viral_analysis_winning_patterns (pattern_name);
+
+-- ---------------------------------------------------------------------
+-- 17. viral_analysis_content_opportunities (Agent 3)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS viral_analysis_content_opportunities (
+    id                       BIGSERIAL PRIMARY KEY,
+    analysis_run_id          BIGINT NOT NULL REFERENCES viral_analysis_runs (id) ON DELETE CASCADE,
+    rank                     INT NOT NULL DEFAULT 0,
+    topic                    TEXT NOT NULL,
+    angle                    TEXT NOT NULL,
+    target_audience          TEXT,
+    hook                     TEXT NOT NULL,
+    format                   TEXT NOT NULL,
+    structure                TEXT[],
+    emotion                  TEXT,
+    psychological_trigger    TEXT,
+    why_now                  TEXT NOT NULL,
+    content_gap              TEXT,
+    differentiation_strategy TEXT,
+    call_to_action           TEXT,
+    opportunity_score        NUMERIC(6,2) NOT NULL DEFAULT 0,
+    confidence_score         NUMERIC(6,2) NOT NULL DEFAULT 0,
+    risk_level               TEXT NOT NULL DEFAULT 'Medium',
+    supporting_video_ids     BIGINT[],
+    evidence                 TEXT,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT uq_viral_opportunities_run_rank UNIQUE (analysis_run_id, rank)
+);
+
+-- Migration safety: adds call_to_action when the table already existed
+-- without it (same pattern as collection_jobs.mode).
+ALTER TABLE viral_analysis_content_opportunities
+    ADD COLUMN IF NOT EXISTS call_to_action TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_viral_opportunities_run_id ON viral_analysis_content_opportunities (analysis_run_id);
+CREATE INDEX IF NOT EXISTS idx_viral_opportunities_score  ON viral_analysis_content_opportunities (opportunity_score DESC);
+
+-- ---------------------------------------------------------------------
+-- 18. viral_analysis_prompt_history (Agent 3)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS viral_analysis_prompt_history (
+    id                BIGSERIAL PRIMARY KEY,
+    analysis_run_id   BIGINT NOT NULL REFERENCES viral_analysis_runs (id) ON DELETE CASCADE,
+    prompt            TEXT NOT NULL,
+    ai_response       TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    model             TEXT,
+    temperature       NUMERIC(4,2),
+    tokens_input      INT,
+    tokens_output     INT,
+    execution_time_ms BIGINT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_viral_prompt_history_run_id     ON viral_analysis_prompt_history (analysis_run_id);
+CREATE INDEX IF NOT EXISTS idx_viral_prompt_history_created_at ON viral_analysis_prompt_history (created_at DESC);
+
+-- ---------------------------------------------------------------------
+-- 19. viral_analysis_candidate_snapshots (Agent 3)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS viral_analysis_candidate_snapshots (
+    id                      BIGSERIAL PRIMARY KEY,
+    analysis_run_id         BIGINT NOT NULL REFERENCES viral_analysis_runs (id) ON DELETE CASCADE,
+    video_id                BIGINT NOT NULL REFERENCES trending_videos (id),
+    is_eligible             BOOLEAN NOT NULL DEFAULT FALSE,
+    skip_reason             TEXT,
+    performance_summary_json JSONB,
+    pattern_summary_json    JSONB,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_viral_candidates_run_id  ON viral_analysis_candidate_snapshots (analysis_run_id);
+CREATE INDEX IF NOT EXISTS idx_viral_candidates_video_id ON viral_analysis_candidate_snapshots (video_id);
+CREATE INDEX IF NOT EXISTS idx_viral_candidates_eligible ON viral_analysis_candidate_snapshots (analysis_run_id, is_eligible);
+
+-- ---------------------------------------------------------------------
+-- 20. data_processing_failures (Shared Data Quality / Recovery Framework)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS data_processing_failures (
+    id                  BIGSERIAL PRIMARY KEY,
+    agent_name          TEXT NOT NULL,
+    entity_type         TEXT NOT NULL,
+    entity_id           BIGINT NOT NULL,
+    operation           TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'Retryable',
+    failure_type        TEXT NOT NULL DEFAULT 'Transient',
+    failure_reason      TEXT,
+    exception_type      TEXT,
+    retry_count         INT NOT NULL DEFAULT 0,
+    max_retry_attempts  INT NOT NULL DEFAULT 5,
+    first_attempt_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_attempt_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    next_retry_at       TIMESTAMPTZ,
+    resolved_at         TIMESTAMPTZ,
+    resolution_type     TEXT,
+    raw_reference       TEXT,
+    metadata_json       JSONB,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_data_failures_agent       ON data_processing_failures (agent_name);
+CREATE INDEX IF NOT EXISTS idx_data_failures_entity      ON data_processing_failures (entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_data_failures_status      ON data_processing_failures (status);
+CREATE INDEX IF NOT EXISTS idx_data_failures_next_retry  ON data_processing_failures (next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_data_failures_type        ON data_processing_failures (failure_type);

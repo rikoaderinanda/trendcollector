@@ -25,7 +25,8 @@ public sealed class QueueService : IQueueService
         _logger = logger;
     }
 
-    public async Task<KnowledgeExtractionQueue> EnqueueAsync(long videoId, int priority = 0, CancellationToken cancellationToken = default)
+    public async Task<KnowledgeExtractionQueue> EnqueueAsync(long videoId, int priority = 0,
+        CancellationToken cancellationToken = default)
     {
         if (!await _videoMetadataRepository.ExistsAsync(videoId, cancellationToken))
         {
@@ -35,7 +36,7 @@ public sealed class QueueService : IQueueService
         await _queueRepository.CreateIfNotExistsAsync(videoId, priority, cancellationToken);
 
         var queueItem = await _queueRepository.GetByVideoIdAsync(videoId, cancellationToken)
-            ?? throw new InvalidOperationException($"Failed to create queue item for video {videoId}.");
+                        ?? throw new InvalidOperationException($"Failed to create queue item for video {videoId}.");
 
         _logger.LogInformation(
             "Knowledge extraction queue item {QueueId} created for video {VideoId} with status {Status}.",
@@ -44,16 +45,19 @@ public sealed class QueueService : IQueueService
         return queueItem;
     }
 
-    public Task<IReadOnlyList<KnowledgeExtractionQueue>> GetPendingAsync(int limit, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<KnowledgeExtractionQueue>> GetPendingAsync(int limit,
+        CancellationToken cancellationToken = default)
         => _queueRepository.GetPendingAsync(limit, cancellationToken);
 
-    public Task<IReadOnlyList<KnowledgeExtractionQueue>> ListAsync(string? status, DateTime? date, int limit, int offset, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<KnowledgeExtractionQueue>> ListAsync(string? status, DateTime? date, int limit,
+        int offset, CancellationToken cancellationToken = default)
         => _queueRepository.ListAsync(status, date, limit, offset, cancellationToken);
 
     public Task<KnowledgeExtractionQueue?> GetByIdAsync(long id, CancellationToken cancellationToken = default)
         => _queueRepository.GetByIdAsync(id, cancellationToken);
 
-    public Task<KnowledgeExtractionQueue?> GetByVideoIdAsync(long videoId, CancellationToken cancellationToken = default)
+    public Task<KnowledgeExtractionQueue?> GetByVideoIdAsync(long videoId,
+        CancellationToken cancellationToken = default)
         => _queueRepository.GetByVideoIdAsync(videoId, cancellationToken);
 
     public Task MarkRunningAsync(long id, CancellationToken cancellationToken = default)
@@ -65,33 +69,44 @@ public sealed class QueueService : IQueueService
     public Task MarkTranscriptUnavailableAsync(long id, CancellationToken cancellationToken = default)
         => _queueRepository.MarkTranscriptUnavailableAsync(id, cancellationToken);
 
-    public async Task MarkAttemptFailedAsync(long id, string error, CancellationToken cancellationToken = default)
+    public async Task<bool> MarkAttemptFailedAsync(long id, string error, CancellationToken cancellationToken = default)
     {
         var queueItem = await _queueRepository.GetByIdAsync(id, cancellationToken);
         if (queueItem is null)
         {
-            return;
+            return false;
         }
 
         if (queueItem.RetryCount < _options.RetryCount)
         {
-            // Exponential backoff: 30s → 60s → 120s (2^n * base)
-            var backoffSeconds = TimeSpan.FromSeconds(Math.Pow(2, queueItem.RetryCount) * 30);
-            var nextRetryAt = DateTimeOffset.UtcNow.Add(backoffSeconds);
+            // Exponential backoff: 2^n * base with -25%/+25% random jitter,
+            // capped at RetryMaxBackoffSeconds. Jitter prevents synchronized
+            // retries (thundering herd) from hammering the rate limiter.
+            var baseSeconds = Math.Max(1, _options.RetryBaseBackoffSeconds);
+            var maxSeconds = Math.Max(baseSeconds, _options.RetryMaxBackoffSeconds);
+            var exponential = Math.Pow(2, queueItem.RetryCount) * baseSeconds;
+            var capped = Math.Min(exponential, maxSeconds);
+            var jittered = capped * (0.75 + Random.Shared.NextDouble() * 0.5);
+            var backoff = TimeSpan.FromSeconds(jittered);
+            var nextRetryAt = DateTimeOffset.UtcNow.Add(backoff);
 
             await _queueRepository.MarkRetryAsync(id, error, nextRetryAt, cancellationToken);
             _logger.LogWarning(
-                "Queue item {QueueId} failed (attempt {RetryCount}/{MaxRetries}), scheduled for retry in {BackoffSeconds}s. Error: {Error}",
-                id, queueItem.RetryCount + 1, _options.RetryCount, backoffSeconds.TotalSeconds, error);
-            return;
+                "Queue item {QueueId} failed (attempt {RetryCount}/{MaxRetries}), scheduled for retry in {BackoffSeconds:0}s. Error: {Error}",
+                id, queueItem.RetryCount + 1, _options.RetryCount, backoff.TotalSeconds, error);
+            return true;
         }
 
         await _queueRepository.MarkFailedAsync(id, error, cancellationToken);
         _logger.LogError(
             "Queue item {QueueId} failed permanently after {RetryCount} retries. Error: {Error}",
             id, _options.RetryCount, error);
+        return false;
     }
 
     public Task ResetForRetryAsync(long id, CancellationToken cancellationToken = default)
         => _queueRepository.ResetForRetryAsync(id, cancellationToken);
+
+    public Task<int> ResetAllTranscriptUnavailableAsync(CancellationToken cancellationToken = default)
+        => _queueRepository.ResetAllTranscriptUnavailableAsync(cancellationToken);
 }

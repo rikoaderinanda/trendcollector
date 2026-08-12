@@ -16,6 +16,13 @@ public sealed class TrendTrackingBackgroundService : BackgroundService
     private readonly TrackingModeOptions _options;
     private readonly ILogger<TrendTrackingBackgroundService> _logger;
 
+    /// <summary>How long to wait before the first pass so the discovery
+    /// service can grab the coordinator gate first at startup.</summary>
+    private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(60);
+
+    /// <summary>How long to wait for the coordinator gate before giving up.</summary>
+    private static readonly TimeSpan CoordinatorTimeout = TimeSpan.FromSeconds(30);
+
     public TrendTrackingBackgroundService(
         IServiceScopeFactory scopeFactory,
         CollectionCoordinator coordinator,
@@ -42,16 +49,22 @@ public sealed class TrendTrackingBackgroundService : BackgroundService
             "TrendTrackingBackgroundService started. Tracking every {IntervalMinutes} minutes when search quota is exhausted.",
             interval.TotalMinutes);
 
+        // Give the discovery service a head start at startup so it can finish
+        // its first pass before we contend for the coordinator gate.
+        try
+        {
+            await Task.Delay(StartupDelay, stoppingToken);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                // Wrap in the coordinator so we never run a tracking pass while
-                // a discovery pass (or manual collect) is in-flight.
-                await _coordinator.RunExclusiveAsync(
-                    RunTrackingPassIfNeededAsync,
-                    TimeSpan.FromSeconds(5),
-                    stoppingToken);
+                await RunCycleAsync(stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -75,14 +88,13 @@ public sealed class TrendTrackingBackgroundService : BackgroundService
         _logger.LogInformation("TrendTrackingBackgroundService stopped.");
     }
 
-    private async Task RunTrackingPassIfNeededAsync(CancellationToken cancellationToken)
+    private async Task RunCycleAsync(CancellationToken cancellationToken)
     {
         await using var scope = _scopeFactory.CreateAsyncScope();
         var quotaTracker = scope.ServiceProvider.GetRequiredService<IQuotaTracker>();
-        var trendCollector = scope.ServiceProvider.GetRequiredService<TrendCollectorService>();
 
-        // Only start a tracking pass once search.list is exhausted for today.
-        // Before that point discovery searches still take precedence.
+        // Check the quota *before* taking the coordinator gate, so we never
+        // contend with the discovery service when no tracking pass is needed.
         if (!await quotaTracker.IsSearchQuotaExhaustedAsync(cancellationToken))
         {
             _logger.LogDebug("Search quota not exhausted yet. Skipping tracking pass.");
@@ -90,7 +102,17 @@ public sealed class TrendTrackingBackgroundService : BackgroundService
         }
 
         _logger.LogInformation("Search quota exhausted. Running Tracking Mode statistics refresh.");
-        var summary = await trendCollector.TrackExistingAsync(cancellationToken);
+
+        var trendCollector = scope.ServiceProvider.GetRequiredService<TrendCollectorService>();
+
+        // Only acquire the gate when we actually need to run a tracking pass.
+        // This prevents the "Another collection/tracking operation is still
+        // running" error that used to occur at startup when the discovery
+        // service was already holding the gate.
+        var summary = await _coordinator.RunExclusiveAsync(
+            ct => trendCollector.TrackExistingAsync(ct),
+            CoordinatorTimeout,
+            cancellationToken);
 
         _logger.LogInformation(
             "Tracking pass finished: collected={Collected}, tracked={Tracked}, skipped={Skipped}, duration={DurationMs}ms.",

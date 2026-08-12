@@ -155,6 +155,16 @@ public sealed class DiscoveryOpenAICompatibleProvider : ITrendDiscoveryAIProvide
             Avoid generic keywords.
             Prefer emerging topics.
 
+            IMPORTANT:
+            Focus on topics that are suitable for YouTube SHORTS -
+            short-form, vertical videos under 60 seconds.
+            Prefer topics that are:
+            - visually engaging
+            - quick to understand
+            - trendy / timely
+            - have a clear hook in the first 3 seconds
+            - are likely to be searched or viewed in the next 24-48 hours
+
             Return:
             - Keyword
             - Niche

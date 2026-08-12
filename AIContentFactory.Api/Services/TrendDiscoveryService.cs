@@ -18,6 +18,9 @@ public sealed class TrendDiscoveryService
     private readonly ITrendKeywordRepository _keywordRepository;
     private readonly ITrendDiscoveryJobRepository _jobRepository;
     private readonly ITrendDiscoveryPromptHistoryRepository _historyRepository;
+    private readonly Agent0KeywordValidator _keywordValidator;
+    private readonly IDataProcessingFailureRepository _failureRepo;
+    private readonly RetryCalculator _retryCalculator;
     private readonly TrendDiscoveryOptions _options;
     private readonly ILogger<TrendDiscoveryService> _logger;
 
@@ -26,6 +29,9 @@ public sealed class TrendDiscoveryService
         ITrendKeywordRepository keywordRepository,
         ITrendDiscoveryJobRepository jobRepository,
         ITrendDiscoveryPromptHistoryRepository historyRepository,
+        Agent0KeywordValidator keywordValidator,
+        IDataProcessingFailureRepository failureRepo,
+        RetryCalculator retryCalculator,
         IOptions<TrendDiscoveryOptions> options,
         ILogger<TrendDiscoveryService> logger)
     {
@@ -33,6 +39,9 @@ public sealed class TrendDiscoveryService
         _keywordRepository = keywordRepository;
         _jobRepository = jobRepository;
         _historyRepository = historyRepository;
+        _keywordValidator = keywordValidator;
+        _failureRepo = failureRepo;
+        _retryCalculator = retryCalculator;
         _options = options.Value;
         _logger = logger;
     }
@@ -52,6 +61,8 @@ public sealed class TrendDiscoveryService
         };
 
         var jobId = await _jobRepository.CreateAsync(job, cancellationToken);
+        using var scope =
+            _logger.BeginScope(new Dictionary<string, object> { ["CorrelationId"] = $"discovery:{jobId}" });
         _logger.LogInformation("Trend discovery job {JobId} started.", jobId);
 
         try
@@ -65,8 +76,8 @@ public sealed class TrendDiscoveryService
                 MaxKeywords = _options.MaxKeywordsPerRun
             };
 
-            // 2. Call AI provider
-            var aiResponse = await _aiProvider.DiscoverTrendsAsync(request, cancellationToken);
+            // 2. Call AI provider with retry for transient failures.
+            var aiResponse = await CallAiWithRetryAsync(request, jobId, cancellationToken);
 
             // 3. Save prompt history (full audit trail - never discards prompts)
             await _historyRepository.CreateAsync(new TrendDiscoveryPromptHistory
@@ -96,19 +107,57 @@ public sealed class TrendDiscoveryService
                 _logger.LogWarning("Trend discovery job {JobId} received no keywords from AI.", jobId);
             }
 
-            // 5. Upsert keywords (duplicate-safe, updates priority)
+            // 5. Validate & upsert keywords (duplicate-safe, updates priority)
+            var validCount = 0;
+            var cleanedCount = 0;
             foreach (var item in discovered)
             {
-                await _keywordRepository.UpsertAsync(new TrendKeyword
+                var keyword = new TrendKeyword
                 {
-                    Keyword = item.Keyword,
-                    Niche = item.Niche,
-                    Country = item.Country,
-                    Language = item.Language,
+                    Keyword = DataCleanser.NormalizeString(item.Keyword) ?? item.Keyword,
+                    Niche = DataCleanser.NormalizeString(item.Niche),
+                    Country = DataCleanser.NormalizeString(item.Country) ?? "Global",
+                    Language = DataCleanser.NormalizeString(item.Language) ?? "en",
                     Priority = item.Priority,
                     DiscoveryReason = item.Reason,
                     Source = DiscoverySource.AI,
                     Status = KeywordStatus.Active
+                };
+
+                var validation = _keywordValidator.Validate(keyword);
+                if (validation.IsInvalid)
+                {
+                    _logger.LogWarning("Skipping invalid keyword '{Keyword}': {Reason}", keyword.Keyword,
+                        string.Join("; ", validation.Reasons));
+                    continue;
+                }
+
+                if (validation.IsIncomplete)
+                {
+                    _logger.LogInformation("Keyword '{Keyword}' marked incomplete: {Reason}", keyword.Keyword,
+                        string.Join("; ", validation.Reasons));
+                }
+
+                await _keywordRepository.UpsertAsync(keyword, cancellationToken);
+                validCount++;
+            }
+
+            if (validCount < discovered.Count)
+            {
+                _logger.LogWarning("Trend discovery job {JobId}: {Valid}/{Total} keywords passed validation.", jobId,
+                    validCount, discovered.Count);
+                await _failureRepo.RecordAsync(new DataProcessingFailure
+                {
+                    AgentName = "TrendDiscovery",
+                    EntityType = "TrendDiscoveryJob",
+                    EntityId = jobId,
+                    Operation = "discover",
+                    Status = "Incomplete",
+                    FailureType = "Permanent",
+                    FailureReason = $"{validCount}/{discovered.Count} keywords passed validation.",
+                    FirstAttemptAt = DateTimeOffset.UtcNow,
+                    LastAttemptAt = DateTimeOffset.UtcNow,
+                    RawReference = $"trend_discovery_prompt_history.job_id={jobId}"
                 }, cancellationToken);
             }
 
@@ -129,6 +178,65 @@ public sealed class TrendDiscoveryService
             await _jobRepository.FailAsync(jobId, ex.Message, CancellationToken.None);
             return BuildResponse(jobId, startedAt, TrendDiscoveryJobStatus.Failed, 0, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// Calls the AI provider with exponential backoff retry for transient
+    /// failures. Records a DataProcessingFailure if all attempts fail.
+    /// </summary>
+    private async Task<AIContentFactory.Api.AI.TrendDiscoveryAIResponse> CallAiWithRetryAsync(
+        TrendDiscoveryAIRequest request,
+        long jobId,
+        CancellationToken cancellationToken)
+    {
+        Exception? lastException = null;
+
+        for (var attempt = 0; _retryCalculator.ShouldRetry(attempt - 1) || attempt == 0; attempt++)
+        {
+            if (attempt > 0)
+            {
+                var delay = _retryCalculator.Calculate(attempt - 1);
+                _logger.LogWarning(
+                    "Retrying AI provider for trend discovery (attempt {Attempt}) after {Delay:0}s. Job {JobId}.",
+                    attempt, delay.TotalSeconds, jobId);
+                await Task.Delay(delay, cancellationToken);
+            }
+
+            try
+            {
+                var response = await _aiProvider.DiscoverTrendsAsync(request, cancellationToken);
+                if (response.Success)
+                {
+                    return response;
+                }
+
+                lastException = new InvalidOperationException(response.ErrorMessage ?? "AI provider failed.");
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+            }
+        }
+
+        await _failureRepo.RecordAsync(new DataProcessingFailure
+        {
+            AgentName = "TrendDiscovery",
+            EntityType = "TrendDiscoveryJob",
+            EntityId = jobId,
+            Operation = "discover",
+            Status = "Retryable",
+            FailureType = "Transient",
+            FailureReason = lastException?.Message ?? "AI provider call failed after retries.",
+            ExceptionType = lastException?.GetType().FullName,
+            RetryCount = 0,
+            MaxRetryAttempts = (int)Math.Max(1, _retryCalculator.ShouldRetry(int.MaxValue) ? 0 : 5),
+            FirstAttemptAt = DateTimeOffset.UtcNow,
+            LastAttemptAt = DateTimeOffset.UtcNow,
+            RawReference = $"trend_discovery_jobs.id={jobId}"
+        }, cancellationToken);
+
+        throw lastException ??
+              new InvalidOperationException("AI provider call failed after retries.");
     }
 
     private static List<AIDiscoveredKeyword> ParseKeywords(string rawJson)

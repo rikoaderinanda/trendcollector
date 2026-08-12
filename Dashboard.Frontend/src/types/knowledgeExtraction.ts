@@ -9,6 +9,7 @@ export interface KnowledgeExtractionJobDto {
   finishedAt?: string;
   durationMs?: number;
   errorMessage?: string;
+  transcriptScore?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -23,6 +24,11 @@ export interface RunKnowledgeExtractionResponse {
   finishedAt: string;
 }
 
+export interface RetryTranscriptUnavailableResponse {
+  resetCount: number;
+}
+
+/** Mirrors AIContentFactory.Api.Models.Entities.TrendingVideoMetadata. */
 export interface TrendingVideoMetadata {
   id: number;
   platformId: number;
@@ -34,49 +40,54 @@ export interface TrendingVideoMetadata {
   publishedAt?: string;
   duration?: string;
   category?: string;
+  tags?: string[];
   language?: string;
   captionAvailable?: boolean;
-  definition?: string;
-  dimension?: string;
-  projection?: string;
-  thumbnailDefaultUrl?: string;
-  thumbnailMediumUrl?: string;
-  thumbnailHighUrl?: string;
-  thumbnailStandardUrl?: string;
-  thumbnailMaxresUrl?: string;
-  processedAt?: string;
-  createdAt: string;
-  updatedAt: string;
 }
 
+/** Mirrors AIContentFactory.Api.Models.Entities.VideoTranscript. */
 export interface VideoTranscript {
   id: number;
   videoId: number;
-  transcriptText?: string;
+  transcript: string;
   language?: string;
-  isGenerated?: boolean;
-  fetchedAt: string;
+  source?: string;
+  transcriptScore?: number | null;
   createdAt: string;
-  updatedAt: string;
 }
 
+/** Mirrors AIContentFactory.Api.Models.Entities.VideoKnowledge. */
 export interface VideoKnowledge {
   id: number;
   videoId: number;
   summary?: string;
-  keyPoints?: string[];
-  entities?: string[];
-  topics?: string[];
-  sentiment?: string;
-  contentType?: string;
+  mainTopic?: string;
+  keywords?: string[];
   targetAudience?: string;
-  contentIdeas?: string[];
-  rawJson?: string;
-  modelVersion?: string;
+  tone?: string;
+  hook?: string;
+  contentStructure?: string[];
+  callToAction?: string;
+  importantPoints?: string[];
+  learningNotes?: string[];
+  interestingFacts?: string[];
+  psychologicalTriggers?: string[];
+  storyPattern?: string;
+  contentType?: string;
+  difficultyLevel?: string;
+  language?: string;
+  emotion?: string;
+  curiosityScore?: number;
+  educationalValue?: number;
+  entertainmentValue?: number;
+  engagementTechniques?: string[];
+  retentionStrategy?: string;
+  suggestedImprovements?: string[];
   createdAt: string;
   updatedAt: string;
 }
 
+/** Mirrors AIContentFactory.Api.Models.Entities.KnowledgeExtractionQueue. */
 export interface KnowledgeExtractionQueueEntity {
   id: number;
   videoId: number;
@@ -92,6 +103,7 @@ export interface KnowledgeExtractionQueueEntity {
   updatedAt: string;
 }
 
+/** Mirrors AIContentFactory.Api.Models.Dtos.KnowledgeExtractionDetailDto. */
 export interface KnowledgeExtractionDetailDto {
   metadata?: TrendingVideoMetadata;
   transcript?: VideoTranscript;

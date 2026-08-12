@@ -18,5 +18,11 @@ public sealed class VideoTranscript
     /// <summary>Source of the transcript, e.g. "youtube_captions".</summary>
     public string? Source { get; set; }
 
+    /// <summary>
+    /// AI-assessed quality score (0-100) of the polished transcript.
+    /// Set by the transcript polishing flow (Reconstruct + AI).
+    /// </summary>
+    public int? TranscriptScore { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
 }

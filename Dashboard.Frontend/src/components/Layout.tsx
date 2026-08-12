@@ -7,6 +7,7 @@ const navItems = [
   { to: '/collector/videos', label: 'Videos', icon: '🎬' },
   { to: '/collector/jobs', label: 'Collection Jobs', icon: '📥' },
   { to: '/knowledge-extraction/jobs', label: 'Knowledge Extraction', icon: '🧠' },
+  { to: '/viral-analysis/runs', label: 'Viral Analysis', icon: '🎯' },
   { to: '/workflow', label: 'Workflow', icon: '🔗' },
 ];
 

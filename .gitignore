@@ -24,6 +24,9 @@ appsettings.Local.json
 *.env
 .env
 
+# Temporary diagnostic scripts (not part of the project)
+.tmp-diag/
+
 # Logs
 *.log
 logs/

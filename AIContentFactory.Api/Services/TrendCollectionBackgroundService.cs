@@ -14,6 +14,9 @@ public sealed class TrendCollectionBackgroundService : BackgroundService
 {
     private const int BatchSize = 10;
 
+    /// <summary>How long to wait for the coordinator gate before giving up.</summary>
+    private static readonly TimeSpan CoordinatorTimeout = TimeSpan.FromSeconds(30);
+
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly CollectionCoordinator _coordinator;
     private readonly TrendCollectorOptions _options;
@@ -45,7 +48,7 @@ public sealed class TrendCollectionBackgroundService : BackgroundService
                 // a tracking pass (or manual collect) is in-flight.
                 await _coordinator.RunExclusiveAsync(
                     ProcessPendingKeywordsAsync,
-                    TimeSpan.FromSeconds(5),
+                    CoordinatorTimeout,
                     stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

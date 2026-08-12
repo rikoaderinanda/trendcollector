@@ -7,6 +7,7 @@ using AIContentFactory.Api.Repositories;
 using AIContentFactory.Api.Services;
 using AIContentFactory.Api.Transcript;
 using AIContentFactory.Api.Workers;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -31,6 +32,12 @@ builder.Services.Configure<KnowledgeExtractionOptions>(
 
 builder.Services.Configure<TrackingModeOptions>(
     builder.Configuration.GetSection(TrackingModeOptions.SectionName));
+
+builder.Services.Configure<TranscriptOptions>(
+    builder.Configuration.GetSection(TranscriptOptions.SectionName));
+
+builder.Services.Configure<ViralAnalysisOptions>(
+    builder.Configuration.GetSection(ViralAnalysisOptions.SectionName));
 
 // Data access
 var connectionString = builder.Configuration.GetConnectionString("Postgres")
@@ -58,9 +65,47 @@ builder.Services.AddScoped<IVideoKnowledgeRepository, VideoKnowledgeRepository>(
 builder.Services.AddScoped<IVideoKnowledgeRawRepository, VideoKnowledgeRawRepository>();
 builder.Services.AddScoped<IVideoMetadataRepository, VideoMetadataRepository>();
 
+// ---- Agent 3: Viral Analyzer repositories ----
+builder.Services.AddScoped<IViralAnalysisRepository, ViralAnalysisRepository>();
+
+// ---- Shared infrastructure: Data Quality / Recovery Framework ----
+builder.Services.AddScoped<IDataProcessingFailureRepository, DataProcessingFailureRepository>();
+builder.Services.AddSingleton(RetryPolicy.Default);
+builder.Services.AddSingleton<RetryCalculator>();
+
+// ---- Shared infrastructure: Metrics & Observability ----
+builder.Services.AddSingleton<IAgentMetricsTracker, AgentMetricsTracker>();
+
+// ---- Agent-specific validators ----
+builder.Services.AddSingleton<Agent0KeywordValidator>();
+builder.Services.AddSingleton<Agent1VideoValidator>();
+builder.Services.AddSingleton<Agent2KnowledgeValidator>();
+builder.Services.AddSingleton<Agent3CandidateValidator>();
+
 // ---- External HTTP clients ----
 builder.Services.AddHttpClient<IYouTubeApiService, YouTubeApiService>();
-builder.Services.AddHttpClient<ITranscriptProvider, YouTubeTranscriptProvider>();
+builder.Services.AddHttpClient<YouTubeTranscriptProvider>();
+
+// ---- Transcript providers (composite: HTTP scraping primary, yt-dlp fallback) ----
+// Shared singleton rate limiter pacing all yt-dlp invocations in the
+// process (minimum interval via Transcript:MinimumRequestIntervalSeconds).
+builder.Services.AddSingleton(sp =>
+{
+    var options = sp.GetRequiredService<IOptions<TranscriptOptions>>().Value;
+    var logger = sp.GetRequiredService<ILogger<YtDlpRateLimiter>>();
+    return new YtDlpRateLimiter(
+        TimeSpan.FromSeconds(Math.Max(1, options.MinimumRequestIntervalSeconds)),
+        logger);
+});
+builder.Services.AddSingleton<YtDlpTranscriptProvider>();
+builder.Services.AddSingleton<ITranscriptProvider>(sp =>
+{
+    var primary = sp.GetRequiredService<YouTubeTranscriptProvider>();
+    var fallback = sp.GetRequiredService<YtDlpTranscriptProvider>();
+    var options = sp.GetRequiredService<IOptions<TranscriptOptions>>();
+    var logger = sp.GetRequiredService<ILogger<CompositeTranscriptProvider>>();
+    return new CompositeTranscriptProvider(primary, fallback, options, logger);
+});
 
 // ---- Trend Discovery AI provider selection ----
 var discoveryAiProvider = builder.Configuration.GetValue<string>($"{TrendDiscoveryOptions.SectionName}:AIProvider") ?? "OpenAICompatible";
@@ -82,11 +127,29 @@ var extractionAiProvider = builder.Configuration.GetValue<string>($"{KnowledgeEx
 switch (extractionAiProvider)
 {
     case "OpenAICompatible":
-        builder.Services.AddHttpClient<IKnowledgeExtractionProvider, ExtractionOpenAICompatibleProvider>();
+        builder.Services.AddHttpClient<IKnowledgeExtractionProvider, ExtractionOpenAICompatibleProvider>()
+            // Transcript polishing can take several minutes on long videos
+            // (58K chars × 16000 tokens). Default HttpClient timeout is 100s.
+            .ConfigureHttpClient(client => client.Timeout = TimeSpan.FromMinutes(5));
         break;
     case "NoOp":
     default:
         builder.Services.AddSingleton<IKnowledgeExtractionProvider, ExtractionNoOpAIProvider>();
+        break;
+}
+
+// ---- Viral Analysis AI provider selection ----
+var viralAnalysisAiProvider =
+    builder.Configuration.GetValue<string>($"{ViralAnalysisOptions.SectionName}:AIProvider") ?? "OpenAICompatible";
+
+switch (viralAnalysisAiProvider)
+{
+    case "OpenAICompatible":
+        builder.Services.AddHttpClient<IViralAnalysisProvider, ViralAnalysisOpenAICompatibleProvider>();
+        break;
+    case "NoOp":
+    default:
+        builder.Services.AddSingleton<IViralAnalysisProvider, ViralAnalysisNoOpProvider>();
         break;
 }
 
@@ -99,11 +162,21 @@ builder.Services.AddScoped<TrendCollectorService>();
 builder.Services.AddScoped<IQueueService, QueueService>();
 builder.Services.AddScoped<IKnowledgeExtractionService, KnowledgeExtractionService>();
 
+// ---- Agent 3: Viral Analyzer services ----
+builder.Services.AddScoped<IPerformanceAnalysisService, PerformanceAnalysisService>();
+builder.Services.AddScoped<IPatternAnalysisService, PatternAnalysisService>();
+builder.Services.AddScoped<IContentGapAnalyzer, ContentGapAnalyzer>();
+builder.Services.AddScoped<IContentOpportunityScorer, ContentOpportunityScorer>();
+builder.Services.AddScoped<ITrendClassifier, TrendClassifier>();
+builder.Services.AddScoped<IViralAnalysisService, ViralAnalysisService>();
+
 // ---- Background services ----
 builder.Services.AddHostedService<TrendCollectionBackgroundService>();
 builder.Services.AddHostedService<TrendTrackingBackgroundService>();
 builder.Services.AddHostedService<KnowledgeExtractionBackgroundService>();
 builder.Services.AddHostedService<DataRetentionBackgroundService>();
+builder.Services.AddHostedService<ViralAnalysisBackgroundService>();
+builder.Services.AddHostedService<DataRecoveryBackgroundService>();
 
 // CORS policy for the React dashboard (development)
 const string dashboardCorsPolicy = "DashboardFrontendCors";
@@ -151,7 +224,13 @@ await using (var scope = app.Services.CreateAsyncScope())
     await initializer.InitializeAsync(app.Lifetime.ApplicationStopping);
 }
 
-app.UseHttpsRedirection();
+// HTTPS redirection only in non-development. In development the app runs on
+// plain HTTP (see launchSettings.json), which makes
+// UseHttpsRedirection emit "Failed to determine the https port for redirect".
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
 
 app.UseCors(dashboardCorsPolicy);
 

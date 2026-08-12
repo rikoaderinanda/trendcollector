@@ -20,6 +20,7 @@ public sealed class KnowledgeExtractionJobDtoExample : IExamplesProvider<Knowled
             FinishedAt = null,
             DurationMs = null,
             ErrorMessage = null,
+            TranscriptScore = 87,
             CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-1),
             UpdatedAt = DateTimeOffset.UtcNow
         };

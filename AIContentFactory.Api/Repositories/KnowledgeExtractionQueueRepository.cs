@@ -89,18 +89,40 @@ public sealed class KnowledgeExtractionQueueRepository : IKnowledgeExtractionQue
             new { VideoId = videoId }, commandTimeout: 30);
     }
 
+    /// <summary>
+    /// Lists queued jobs, optionally filtered by status and the calendar date of
+    /// created_at. Left-joins video_transcripts so each row exposes the AI
+    /// transcript quality score when one exists.
+    /// </summary>
     public async Task<IReadOnlyList<KnowledgeExtractionQueue>> ListAsync(string? status, DateTime? date, int limit, int offset, CancellationToken cancellationToken = default)
     {
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
+        const string listSelectColumns = """
+                                         q.id               AS Id,
+                                         q.video_id         AS VideoId,
+                                         q.status           AS Status,
+                                         q.priority         AS Priority,
+                                         q.retry_count      AS RetryCount,
+                                         q.next_retry_at    AS NextRetryAt,
+                                         q.started_at       AS StartedAt,
+                                         q.finished_at      AS FinishedAt,
+                                         q.duration_ms      AS DurationMs,
+                                         q.error_message    AS ErrorMessage,
+                                         q.created_at       AS CreatedAt,
+                                         q.updated_at       AS UpdatedAt,
+                                         vt.transcript_score AS TranscriptScore
+                                         """;
+
         const string sql = $$"""
-            SELECT {{SelectColumns}}
-            FROM knowledge_extraction_queue
-            WHERE (@Status IS NULL OR status = @Status)
-              AND (@Date::date IS NULL OR created_at::date = @Date::date)
-            ORDER BY created_at DESC
-            LIMIT @Limit OFFSET @Offset;
-            """;
+                             SELECT {{listSelectColumns}}
+                             FROM knowledge_extraction_queue q
+                             LEFT JOIN video_transcripts vt ON vt.video_id = q.video_id
+                             WHERE (@Status IS NULL OR q.status = @Status)
+                               AND (@Date::date IS NULL OR q.created_at::date = @Date::date)
+                             ORDER BY q.created_at DESC
+                             LIMIT @Limit OFFSET @Offset;
+                             """;
 
         var results = await connection.QueryAsync<KnowledgeExtractionQueue>(sql,
             new { Status = status, Date = date, Limit = limit, Offset = offset }, commandTimeout: 30);
@@ -113,12 +135,12 @@ public sealed class KnowledgeExtractionQueueRepository : IKnowledgeExtractionQue
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
         const string sql = """
-            UPDATE knowledge_extraction_queue
-            SET status = 'Running',
-                started_at = now(),
-                updated_at = now()
-            WHERE id = @Id;
-            """;
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'Running',
+                               started_at = now(),
+                               updated_at = now()
+                           WHERE id = @Id;
+                           """;
 
         await connection.ExecuteAsync(sql, new { Id = id }, commandTimeout: 30);
     }
@@ -128,14 +150,14 @@ public sealed class KnowledgeExtractionQueueRepository : IKnowledgeExtractionQue
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
         const string sql = """
-            UPDATE knowledge_extraction_queue
-            SET status = 'Completed',
-                finished_at = now(),
-                duration_ms = @DurationMs,
-                error_message = NULL,
-                updated_at = now()
-            WHERE id = @Id;
-            """;
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'Completed',
+                               finished_at = now(),
+                               duration_ms = @DurationMs,
+                               error_message = NULL,
+                               updated_at = now()
+                           WHERE id = @Id;
+                           """;
 
         await connection.ExecuteAsync(sql, new { Id = id, DurationMs = durationMs }, commandTimeout: 30);
     }
@@ -145,31 +167,33 @@ public sealed class KnowledgeExtractionQueueRepository : IKnowledgeExtractionQue
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
         const string sql = """
-            UPDATE knowledge_extraction_queue
-            SET status = 'TranscriptUnavailable',
-                finished_at = now(),
-                updated_at = now()
-            WHERE id = @Id;
-            """;
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'TranscriptUnavailable',
+                               finished_at = now(),
+                               updated_at = now()
+                           WHERE id = @Id;
+                           """;
 
         await connection.ExecuteAsync(sql, new { Id = id }, commandTimeout: 30);
     }
 
-    public async Task MarkRetryAsync(long id, string error, DateTimeOffset nextRetryAt, CancellationToken cancellationToken = default)
+    public async Task MarkRetryAsync(long id, string error, DateTimeOffset nextRetryAt,
+        CancellationToken cancellationToken = default)
     {
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
         const string sql = """
-            UPDATE knowledge_extraction_queue
-            SET status = 'Pending',
-                retry_count = retry_count + 1,
-                error_message = @Error,
-                next_retry_at = @NextRetryAt,
-                updated_at = now()
-            WHERE id = @Id;
-            """;
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'Pending',
+                               retry_count = retry_count + 1,
+                               error_message = @Error,
+                               next_retry_at = @NextRetryAt,
+                               updated_at = now()
+                           WHERE id = @Id;
+                           """;
 
-        await connection.ExecuteAsync(sql, new { Id = id, Error = error, NextRetryAt = nextRetryAt }, commandTimeout: 30);
+        await connection.ExecuteAsync(sql, new { Id = id, Error = error, NextRetryAt = nextRetryAt },
+            commandTimeout: 30);
     }
 
     public async Task MarkFailedAsync(long id, string error, CancellationToken cancellationToken = default)
@@ -177,13 +201,13 @@ public sealed class KnowledgeExtractionQueueRepository : IKnowledgeExtractionQue
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
         const string sql = """
-            UPDATE knowledge_extraction_queue
-            SET status = 'Failed',
-                finished_at = now(),
-                error_message = @Error,
-                updated_at = now()
-            WHERE id = @Id;
-            """;
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'Failed',
+                               finished_at = now(),
+                               error_message = @Error,
+                               updated_at = now()
+                           WHERE id = @Id;
+                           """;
 
         await connection.ExecuteAsync(sql, new { Id = id, Error = error }, commandTimeout: 30);
     }
@@ -193,18 +217,39 @@ public sealed class KnowledgeExtractionQueueRepository : IKnowledgeExtractionQue
         await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
 
         const string sql = """
-            UPDATE knowledge_extraction_queue
-            SET status = 'Pending',
-                retry_count = 0,
-                error_message = NULL,
-                next_retry_at = NULL,
-                started_at = NULL,
-                finished_at = NULL,
-                duration_ms = NULL,
-                updated_at = now()
-            WHERE id = @Id;
-            """;
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'Pending',
+                               retry_count = 0,
+                               error_message = NULL,
+                               next_retry_at = NULL,
+                               started_at = NULL,
+                               finished_at = NULL,
+                               duration_ms = NULL,
+                               updated_at = now()
+                           WHERE id = @Id;
+                           """;
 
         await connection.ExecuteAsync(sql, new { Id = id }, commandTimeout: 30);
+    }
+
+    public async Task<int> ResetAllTranscriptUnavailableAsync(CancellationToken cancellationToken = default)
+    {
+        await using var connection = await _connectionFactory.CreateConnectionAsync(cancellationToken);
+
+        const string sql = """
+                           UPDATE knowledge_extraction_queue
+                           SET status = 'Pending',
+                               retry_count = 0,
+                               error_message = NULL,
+                               next_retry_at = NULL,
+                               started_at = NULL,
+                               finished_at = NULL,
+                               duration_ms = NULL,
+                               updated_at = now()
+                           WHERE status = 'TranscriptUnavailable';
+                           """;
+
+        var affected = await connection.ExecuteAsync(sql, commandTimeout: 30);
+        return affected;
     }
 }

@@ -1,0 +1,624 @@
+using System.Diagnostics;
+using System.Text;
+using System.Text.RegularExpressions;
+using AIContentFactory.Api.Configuration;
+using AIContentFactory.Api.Models.Entities;
+using Microsoft.Extensions.Options;
+
+namespace AIContentFactory.Api.Transcript;
+
+/// <summary>
+/// Retrieves YouTube captions by invoking the <c>yt-dlp</c> executable in
+/// subprocess mode.
+///
+/// yt-dlp internally handles the proof-of-origin token (po_token) challenge
+/// that YouTube now requires for its transcript endpoints. Raw HTTP scraping
+/// (see <see cref="YouTubeTranscriptProvider"/>) returns HTTP 200 with an
+/// empty body on the timedtext endpoint and HTTP 400 on
+/// <c>youtubei/v1/get_transcript</c> without a po_token, so this provider is
+/// the reliable fallback when scraping fails.
+/// </summary>
+public sealed class YtDlpTranscriptProvider : ITranscriptProvider
+{
+    /// <summary>Subtitle formats accepted by yt-dlp, oldest fallback first.</summary>
+    private static readonly string[] SubtitleTags =
+        ["vtt", "srt", "ass", "json3", "srv3"];
+
+    private const string TranscriptSource = "yt_dlp";
+
+    private readonly ILogger<YtDlpTranscriptProvider> _logger;
+    private readonly TranscriptOptions _options;
+    private readonly string _ytDlpPath;
+
+    public YtDlpTranscriptProvider(
+        IOptions<TranscriptOptions> options,
+        ILogger<YtDlpTranscriptProvider> logger)
+    {
+        _options = options.Value;
+        _logger = logger;
+        _ytDlpPath = string.IsNullOrWhiteSpace(_options.YtDlpPath)
+            ? "yt-dlp"
+            : _options.YtDlpPath;
+
+        if (_ytDlpPath.Contains(' ') &&
+            !_ytDlpPath.StartsWith('"') &&
+            !_ytDlpPath.Contains(".exe", StringComparison.OrdinalIgnoreCase))
+        {
+            // The path does not end with an executable and contains spaces;
+            // the user likely gave a command name with arguments. Keep it as-is.
+        }
+    }
+
+    public async Task<VideoTranscript?> GetTranscriptAsync(
+        string platformVideoId,
+        string? preferredLanguage = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(platformVideoId))
+        {
+            _logger.LogWarning("yt-dlp transcript skipped: empty video id.");
+            return null;
+        }
+
+        var fallbackTimeout = TimeSpan.FromSeconds(Math.Max(5, _options.FallbackTimeoutSeconds));
+
+        // yt-dlp is not guaranteed to exist. Detect it up-front so we do not
+        // waste a process spawn when it is missing.
+        if (!IsYtDlpAvailable())
+        {
+            _logger.LogError(
+                "yt-dlp executable '{Path}' was not found on this machine. " +
+                "Transcript fallback is unavailable.", _ytDlpPath);
+            return null;
+        }
+
+        // yt-dlp handles consent automatically, but we can speed things up by
+        // passing a consent cookie value that skips the European consent wall.
+        var consentCookie = GetConsentCookie();
+
+        // Preferred language list: the caller preferred language first, then
+        // common fallbacks when the first lookup fails.
+        var languageCandidates = new List<string>(4);
+        if (!string.IsNullOrWhiteSpace(preferredLanguage))
+        {
+            languageCandidates.Add(preferredLanguage);
+        }
+        else
+        {
+            // No preference: ask for English first, then auto-generated.
+            languageCandidates.Add("en");
+        }
+
+        languageCandidates.Add("en-orig");
+        languageCandidates.Add("en");
+        languageCandidates.Add("auto");
+        languageCandidates = languageCandidates.Distinct().ToList();
+
+        // "auto" catches auto-generated captions. "en-orig" catches manual
+        // English captions authored by the uploader.
+        languageCandidates.Add("auto");
+        languageCandidates.Add("en-orig");
+
+        var workDir = CreateTempDirectory();
+        try
+        {
+            foreach (var lang in languageCandidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                _logger.LogDebug(
+                    "yt-dlp: attempting subtitles for video {VideoId} language '{Lang}'.",
+                    platformVideoId, lang);
+
+                var result = await FetchSubtitlesAsync(
+                    platformVideoId,
+                    lang,
+                    workDir,
+                    consentCookie,
+                    fallbackTimeout,
+                    cancellationToken);
+
+                if (result is null)
+                {
+                    continue;
+                }
+
+                _logger.LogInformation(
+                    "yt-dlp: subtitles retrieved for video {VideoId} via language '{Lang}' " +
+                    "({Length} chars, file {File}).",
+                    platformVideoId, result.Subtitle.Length, result.FilePath);
+
+                var combined = NormalizeTranscriptText(result.Subtitle);
+                if (string.IsNullOrWhiteSpace(combined))
+                {
+                    _logger.LogWarning(
+                        "yt-dlp: subtitle file for video {VideoId} language '{Lang}' was empty.",
+                        platformVideoId, lang);
+                    continue;
+                }
+
+                return new VideoTranscript
+                {
+                    Transcript = combined,
+                    Language = NormalizeLanguage(result.Language, lang, preferredLanguage),
+                    Source = TranscriptSource
+                };
+            }
+
+            _logger.LogWarning(
+                "yt-dlp: no subtitles found for video {VideoId} after {Count} language attempts.",
+                platformVideoId, languageCandidates.Count);
+            return null;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogWarning("yt-dlp transcript fetch cancelled for video {VideoId}.", platformVideoId);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "yt-dlp transcript fetch failed for video {VideoId}.", platformVideoId);
+            return null;
+        }
+        finally
+        {
+            TryCleanupDirectory(workDir);
+        }
+    }
+
+    // ---------- yt-dlp subprocess ----------
+
+    private async Task<SubtitleResult?> FetchSubtitlesAsync(
+        string videoId,
+        string languageTag,
+        string workDir,
+        string consentCookie,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var outputTemplate = Path.Combine(workDir, "%(id)s.%(ext)s");
+        var subtitleTemplate = Path.Combine(workDir, "subs_%(ext)s");
+
+        var args = new List<string>
+        {
+            "--no-warnings",
+            "--no-progress",
+            "--skip-download",
+            "--no-part",
+            "--no-mtime",
+            "--write-auto-subs",
+            "--write-subs",
+            "--sub-langs", languageTag,
+            "--sub-format", string.Join("/", SubtitleTags.Select(t => t)),
+            "--sub-language", languageTag,
+            // Write all subtitle formats; we inspect which file got produced.
+            "--print-to-file", "after_move:filepath", Path.Combine(workDir, "files.out.txt"),
+            "--output", outputTemplate,
+            // Prefer a language that exists; yt-dlp falls back to auto-generated
+            // when the requested language only has manual captions.
+            "--sub-langs", $"{languageTag}/auto/{languageTag}-orig",
+            "--convert-subs", "vtt",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+            "--referer", $"https://www.youtube.com/watch?v={videoId}",
+            "--cookies", BuildCookiesFile(consentCookie),
+            $"https://www.youtube.com/watch?v={videoId}"
+        };
+
+        // Remove duplicates from the arg list (sub-langs may have been added
+        // twice above).
+        var finalArgs = new List<string>();
+        for (var i = 0; i < args.Count; i++)
+        {
+            var isSubLangs = args[i] == "--sub-langs";
+            if (isSubLangs && i > 0 && args[i - 1] == "--sub-langs")
+            {
+                continue;
+            }
+            finalArgs.Add(args[i]);
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = _ytDlpPath,
+            WorkingDirectory = workDir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        foreach (var arg in finalArgs)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        using var process = new Process { StartInfo = startInfo };
+        var stdout = new StringBuilder();
+        var stderr = new StringBuilder();
+
+        process.OutputDataReceived += (_, e) =>
+        {
+            if (e.Data is not null)
+            {
+                stdout.AppendLine(e.Data);
+            }
+        };
+        process.ErrorDataReceived += (_, e) =>
+        {
+            if (e.Data is not null)
+            {
+                stderr.AppendLine(e.Data);
+            }
+        };
+
+        try
+        {
+            if (!process.Start())
+            {
+                _logger.LogError("yt-dlp failed to start for video {VideoId}.", videoId);
+                return null;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "yt-dlp failed to start for video {VideoId}.", videoId);
+            return null;
+        }
+
+        process.BeginOutputReadLine();
+        process.BeginErrorReadLine();
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(timeout);
+
+            await process.WaitForExitAsync(timeoutCts.Token);
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                KillProcessTree(process);
+                return null;
+            }
+
+            var exitCode = process.ExitCode;
+            if (exitCode != 0)
+            {
+                _logger.LogWarning(
+                    "yt-dlp exited with code {ExitCode} for video {VideoId} language '{Lang}'. " +
+                    "stderr: {Stderr}",
+                    exitCode, videoId, languageTag, Shorten(stderr.ToString(), 500));
+                return null;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "yt-dlp timed out after {Timeout}s for video {VideoId} language '{Lang}'. Killing process.",
+                timeout.TotalSeconds, videoId, languageTag);
+            KillProcessTree(process);
+            return null;
+        }
+
+        // Locate the produced subtitle file.
+        var filesOut = Path.Combine(workDir, "files.out.txt");
+        var filePaths = new List<string>();
+        if (File.Exists(filesOut))
+        {
+            foreach (var line in File.ReadAllLines(filesOut))
+            {
+                var trimmed = line.Trim();
+                if (!string.IsNullOrEmpty(trimmed))
+                {
+                    filePaths.Add(trimmed);
+                }
+            }
+        }
+        else
+        {
+            filePaths.AddRange(Directory.EnumerateFiles(workDir)
+                .Where(f => Path.GetExtension(f) is ".vtt" or ".srt" or ".ass" or ".json3" or ".srv3"));
+        }
+
+        var subtitleFile = filePaths.FirstOrDefault(f => File.Exists(f));
+
+        // yt-dlp may produce a file with the auto-generated suffix (e.g.
+        // "en.auto.vtt"). The output template uses %(id)s.%(ext)s so the
+        // filename is the video id + extension. When auto subtitles are
+        // produced the filename stays the same.
+        if (subtitleFile is null)
+        {
+            var candidates = Directory.EnumerateFiles(workDir, "*.*")
+                .Where(f => Path.GetExtension(f) is ".vtt" or ".srt" or ".ass" or ".json3" or ".srv3")
+                .ToList();
+            subtitleFile = candidates.FirstOrDefault();
+        }
+
+        if (subtitleFile is null)
+        {
+            _logger.LogDebug(
+                "yt-dlp: no subtitle file produced for video {VideoId} language '{Lang}'. stdout: {Stdout}",
+                videoId, languageTag, Shorten(stdout.ToString(), 300));
+            return null;
+        }
+
+        var fileInfo = new FileInfo(subtitleFile);
+        if (fileInfo.Length <= 0)
+        {
+            _logger.LogDebug("yt-dlp: subtitle file {File} is empty.", subtitleFile);
+            return null;
+        }
+
+        if (fileInfo.Length > _options.MaxSubtitleFileBytes)
+        {
+            _logger.LogWarning(
+                "yt-dlp: subtitle file {File} is {Bytes} bytes, exceeding the {MaxBytes} byte limit.",
+                subtitleFile, fileInfo.Length, _options.MaxSubtitleFileBytes);
+            return null;
+        }
+
+        var content = await File.ReadAllTextAsync(subtitleFile, Encoding.UTF8, cancellationToken);
+        return new SubtitleResult
+        {
+            Subtitle = content,
+            Language = InferLanguage(fileInfo.Name, content),
+            FilePath = subtitleFile
+        };
+    }
+
+    private static string InferLanguage(string fileName, string content)
+    {
+        // Language tag sometimes appears in the filename (e.g. "en.auto.vtt").
+        var match = Regex.Match(fileName, @"\.([a-z]{2,3})(?:\.auto)?\.(?:vtt|srt|ass|json3|srv3)", RegexOptions.IgnoreCase);
+        if (match.Success)
+        {
+            return match.Groups[1].Value.ToLowerInvariant();
+        }
+
+        // Fallback: scan the VTT header for a "Language:" line.
+        var langMatch = Regex.Match(content, @"(?i)language[:\s]+([a-z]{2,3})");
+        if (langMatch.Success)
+        {
+            return langMatch.Groups[1].Value.ToLowerInvariant();
+        }
+
+        return "unknown";
+    }
+
+    private static string NormalizeLanguage(string inferred, string requested, string? callerPreferred)
+    {
+        if (inferred is "unknown" or "auto")
+        {
+            return callerPreferred ?? requested;
+        }
+
+        return inferred;
+    }
+
+    /// <summary>
+    /// Converts VTT/SRT/ASS subtitle content into a plain text transcript.
+    /// Strips timestamps, cue numbers, metadata headers and ASS override tags.
+    /// </summary>
+    internal static string NormalizeTranscriptText(string subtitleContent)
+    {
+        var lines = subtitleContent
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Split('\n');
+
+        var sb = new StringBuilder();
+        var inCue = false;
+        var sawText = false;
+
+        foreach (var line in lines)
+        {
+            var trimmed = line.Trim();
+
+            // Skip VTT/SRT headers and the file metadata block.
+            if (string.IsNullOrEmpty(trimmed))
+            {
+                if (inCue)
+                {
+                    sb.Append(' ');
+                    inCue = false;
+                }
+
+                continue;
+            }
+
+            if (trimmed.StartsWith("WEBVTT", StringComparison.OrdinalIgnoreCase))
+            {
+                inCue = false;
+                continue;
+            }
+
+            if (trimmed.StartsWith("Kind:", StringComparison.OrdinalIgnoreCase) ||
+                trimmed.StartsWith("Language:", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            // Cue header lines like "1" or "00:00:01.000 --> 00:00:04.000".
+            if (Regex.IsMatch(trimmed, @"^\d+$"))
+            {
+                inCue = true;
+                continue;
+            }
+
+            if (trimmed.Contains("-->", StringComparison.Ordinal))
+            {
+                inCue = true;
+                continue;
+            }
+
+            // ASS header / style sections.
+            if (trimmed.StartsWith('[', StringComparison.Ordinal) &&
+                trimmed.EndsWith(']', StringComparison.Ordinal))
+            {
+                inCue = false;
+                continue;
+            }
+
+            // Strip ASS tags ({...}) and HTML tags that some downloads contain.
+            var cleaned = Regex.Replace(trimmed, @"\{[^}]*\}", string.Empty);
+            cleaned = Regex.Replace(cleaned, "<[^>]+>", string.Empty);
+            cleaned = cleaned.Trim();
+
+            // Strip HTML entities that may remain.
+            cleaned = cleaned
+                .Replace("&nbsp;", " ")
+                .Replace("&", "&")
+                .Replace("<", "<")
+                .Replace(">", ">")
+                .Replace(""", "\"")
+                .Replace("&#39;", "'");
+
+            if (cleaned.Length == 0)
+            {
+                continue;
+            }
+
+            if (sawText)
+            {
+                sb.Append(' ');
+            }
+
+            sb.Append(cleaned);
+            sawText = true;
+            inCue = true;
+        }
+
+        return sb.ToString().Trim();
+    }
+
+    // ---------- File & process helpers ----------
+
+    private bool IsYtDlpAvailable()
+    {
+        try
+        {
+            if (File.Exists(_ytDlpPath))
+            {
+                return true;
+            }
+
+            if (_ytDlpPath.IndexOf(Path.DirectorySeparatorChar) >= 0 ||
+                _ytDlpPath.IndexOf(Path.AltDirectorySeparatorChar) >= 0)
+            {
+                // A path was specified but does not exist.
+                return false;
+            }
+
+            // Bare command name: check if it resolves on PATH (Windows "where",
+            // Unix "which"). Use a short-lived process.
+            using var probe = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = Environment.OSVersion.Platform == PlatformID.Win32NT ? "where.exe" : "which",
+                    ArgumentList = { _ytDlpPath },
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+
+            probe.Start();
+            probe.WaitForExit(5000);
+            return probe.ExitCode == 0;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to probe yt-dlp availability at '{Path}'.", _ytDlpPath);
+            return false;
+        }
+    }
+
+    private static string CreateTempDirectory()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "aicf-ytdlp-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static void TryCleanupDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Best-effort cleanup; do not surface a failure from temp cleanup.
+            Console.WriteLine($"Failed to clean up temporary directory: {ex.Message}");
+        }
+    }
+
+    private static void KillProcessTree(Process process)
+    {
+        try
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+                process.WaitForExit(1000);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Best-effort kill.
+            Console.WriteLine($"Failed to kill yt-dlp process: {ex.Message}");
+        }
+    }
+
+    private static string BuildCookiesFile(string consentCookie)
+    {
+        // yt-dlp accepts a cookies file in Netscape format. We generate a
+        // minimal one containing just the consent cookie so the request does
+        // not hit the EU consent wall.
+        if (string.IsNullOrWhiteSpace(consentCookie))
+        {
+            // No cookie: return the fake path; yt-dlp will not use it.
+            return Path.Combine(Path.GetTempPath(), "aicf-ytdlp-nocookies.txt");
+        }
+
+        var path = Path.Combine(Path.GetTempPath(), $"aicf-cookies-{Guid.NewGuid():N}.txt");
+        var lines = new[]
+        {
+            "# Netscape HTTP Cookie File",
+            ".youtube.com\tTRUE\t/\tFALSE\t0\tCONSENT\t" + consentCookie,
+            ".google.com\tTRUE\t/\tFALSE\t0\tCONSENT\t" + consentCookie
+        };
+        File.WriteAllText(path, string.Join("\n", lines));
+        return path;
+    }
+
+    private static string GetConsentCookie()
+    {
+        // A modern consent cookie value that YouTube accepts without showing
+        // the consent wall. "cb" = consent banner version, "p0" = EU region.
+        return "YES+cb.20240101-01-p0.en+FX+700";
+    }
+
+    private static string Shorten(string text, int maxLength)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return string.Empty;
+        }
+
+        var cleaned = text.Replace('\n', ' ').Replace('\r', ' ').Trim();
+        return cleaned.Length <= maxLength ? cleaned : cleaned[..maxLength] + "...";
+    }
+
+    private sealed record SubtitleResult
+    {
+        public required string Subtitle { get; init; }
+        public required string Language { get; init; }
+        public required string FilePath { get; init; }
+    }
+}

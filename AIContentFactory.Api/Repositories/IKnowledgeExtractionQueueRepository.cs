@@ -11,7 +11,8 @@ public interface IKnowledgeExtractionQueueRepository
     Task CreateIfNotExistsAsync(long videoId, int priority = 0, CancellationToken cancellationToken = default);
 
     /// <summary>Gets pending queue items ordered by priority (highest first).</summary>
-    Task<IReadOnlyList<KnowledgeExtractionQueue>> GetPendingAsync(int limit, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<KnowledgeExtractionQueue>> GetPendingAsync(int limit,
+        CancellationToken cancellationToken = default);
 
     /// <summary>Gets a queue item by id, or null when not found.</summary>
     Task<KnowledgeExtractionQueue?> GetByIdAsync(long id, CancellationToken cancellationToken = default);
@@ -20,7 +21,8 @@ public interface IKnowledgeExtractionQueueRepository
     Task<KnowledgeExtractionQueue?> GetByVideoIdAsync(long videoId, CancellationToken cancellationToken = default);
 
     /// <summary>Lists queued jobs, optionally filtered by status and the calendar date of created_at.</summary>
-    Task<IReadOnlyList<KnowledgeExtractionQueue>> ListAsync(string? status, DateTime? date, int limit, int offset, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<KnowledgeExtractionQueue>> ListAsync(string? status, DateTime? date, int limit, int offset,
+        CancellationToken cancellationToken = default);
 
     /// <summary>Transitions a queue item to Running and stamps StartedAt.</summary>
     Task MarkRunningAsync(long id, CancellationToken cancellationToken = default);
@@ -32,11 +34,20 @@ public interface IKnowledgeExtractionQueueRepository
     Task MarkTranscriptUnavailableAsync(long id, CancellationToken cancellationToken = default);
 
     /// <summary>Increments retry_count, resets the item back to Pending and schedules the next retry time.</summary>
-    Task MarkRetryAsync(long id, string error, DateTimeOffset nextRetryAt, CancellationToken cancellationToken = default);
+    Task MarkRetryAsync(long id, string error, DateTimeOffset nextRetryAt,
+        CancellationToken cancellationToken = default);
 
     /// <summary>Transitions a queue item to Failed (permanent).</summary>
     Task MarkFailedAsync(long id, string error, CancellationToken cancellationToken = default);
 
     /// <summary>Resets a failed queue item back to Pending with retry count cleared.</summary>
     Task ResetForRetryAsync(long id, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Resets all queue items in the terminal TranscriptUnavailable state back
+    /// to Pending with retry count cleared, so the background worker can attempt
+    /// them again (e.g. after a transcript fallback provider was added).
+    /// </summary>
+    /// <returns>The number of queue items reset.</returns>
+    Task<int> ResetAllTranscriptUnavailableAsync(CancellationToken cancellationToken = default);
 }

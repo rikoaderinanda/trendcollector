@@ -22,6 +22,9 @@ public sealed class KnowledgeExtractionJobDto
     public long? DurationMs { get; set; }
     public string? ErrorMessage { get; set; }
 
+    /// <summary>AI-assessed quality score (0-100) of the polished transcript, if one exists.</summary>
+    public int? TranscriptScore { get; set; }
+
     public DateTimeOffset CreatedAt { get; set; }
     public DateTimeOffset UpdatedAt { get; set; }
 }

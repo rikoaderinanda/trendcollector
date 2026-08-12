@@ -3,11 +3,14 @@ import { Link } from 'react-router-dom';
 import { useKeywords, useDiscoveryJobs } from '../hooks/useDiscovery';
 import { useVideos, useCollectionJobs } from '../hooks/useCollector';
 import { useKnowledgeExtractionJobs } from '../hooks/useKnowledgeExtraction';
+import { useViralAnalysisRuns, useViralAnalysisRecommendation } from '../hooks/useViralAnalysis';
+import { useRunViralAnalysis } from '../hooks/useViralAnalysis';
 import StatCard from '../components/StatCard';
 import LoadingSpinner from '../components/LoadingSpinner';
 import StatusBadge from '../components/StatusBadge';
 import DiscoveryProgressCard, { type DiscoveryProgressStatus } from '../components/DiscoveryProgressCard';
 import type { RunDiscoveryResponse } from '../types/discovery';
+import type { RunViralAnalysisRequest } from '../types/viralAnalysis';
 import { formatDateTime } from '../utils/formatters';
 import { discoveryApi } from '../api/discoveryApi';
 
@@ -30,6 +33,35 @@ export default function Dashboard() {
   const videosQuery = useVideos({ limit: 100 });
   const collectionJobsQuery = useCollectionJobs(selectedDate, 10);
   const knowledgeExtractionJobsQuery = useKnowledgeExtractionJobs({ date: selectedDate, limit: 10 });
+  const viralAnalysisRunsQuery = useViralAnalysisRuns(10, 0);
+  const runViralAnalysisMutation = useRunViralAnalysis();
+
+  // Latest completed viral analysis for TOP 1 summary (hook must be called
+  // unconditionally per Rules of Hooks — placed before any early return).
+  const latestCompletedRun = (viralAnalysisRunsQuery.data ?? []).find((r) => r.status === 'completed');
+  const latestRunId = latestCompletedRun?.id;
+  const recommendationQuery = useViralAnalysisRecommendation(latestRunId ?? 0);
+  const topRecommendation = latestRunId ? recommendationQuery.data : undefined;
+  const totalOpportunities = (viralAnalysisRunsQuery.data ?? []).reduce((sum, r) => sum + r.opportunitiesGenerated, 0);
+  const avgConfidence = (viralAnalysisRunsQuery.data ?? [])
+    .filter((r) => r.confidenceScore != null)
+    .reduce((sum, r, _, arr) => sum + (r.confidenceScore ?? 0) / (arr.length || 1), 0);
+
+  // Viral analysis state
+  const [runningAnalysis, setRunningAnalysis] = useState(false);
+
+  const handleRunAnalysis = async () => {
+    setRunningAnalysis(true);
+    try {
+      const request: RunViralAnalysisRequest = {};
+      await runViralAnalysisMutation.mutateAsync(request);
+    } catch {
+      // unused
+    } finally {
+      setRunningAnalysis(false);
+      viralAnalysisRunsQuery.refetch();
+    }
+  };
 
   // Discovery progress state
   const [progressStatus, setProgressStatus] = useState<DiscoveryProgressStatus>('idle');
@@ -144,7 +176,8 @@ export default function Dashboard() {
     discoveryJobsQuery.isLoading ||
     videosQuery.isLoading ||
     collectionJobsQuery.isLoading ||
-    knowledgeExtractionJobsQuery.isLoading;
+    knowledgeExtractionJobsQuery.isLoading ||
+    viralAnalysisRunsQuery.isLoading;
 
   if (isLoading) {
     return <LoadingSpinner text="Loading dashboard..." />;
@@ -155,6 +188,7 @@ export default function Dashboard() {
   const allVideos = videosQuery.data ?? [];
   const collectionJobs = collectionJobsQuery.data ?? [];
   const knowledgeExtractionJobs = knowledgeExtractionJobsQuery.data ?? [];
+  const viralRuns = viralAnalysisRunsQuery.data ?? [];
 
   // Client-side date filter for keywords & videos (backend has no date param for these)
   const keywords = allKeywords.filter((k) => sameDay(k.createdAt, selectedDate));
@@ -219,7 +253,7 @@ export default function Dashboard() {
         onRetry={handleRetry}
       />
 
-      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-5 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
         <StatCard
           title="Total Keywords"
           value={totalKeywords}
@@ -255,6 +289,123 @@ export default function Dashboard() {
           icon="🧠"
           accentColor="bg-orange-50 text-orange-600"
         />
+        <StatCard
+          title="Viral Analysis Runs"
+          value={viralRuns.length}
+          subtitle={`${viralRuns.filter((r) => r.status === 'completed').length} completed`}
+          icon="🚀"
+          accentColor="bg-rose-50 text-rose-600"
+        />
+        <StatCard
+          title="Opportunities"
+          value={totalOpportunities}
+          subtitle={`${topRecommendation ? `TOP1: ${topRecommendation.opportunity.topic}` : 'No recommendation yet'}`}
+          icon="💡"
+          accentColor="bg-cyan-50 text-cyan-600"
+        />
+        <StatCard
+          title="Avg Confidence"
+          value={avgConfidence.toFixed(0)}
+          subtitle={latestCompletedRun ? `Latest run #${latestCompletedRun.id}` : 'No completed runs'}
+          icon="🎯"
+          accentColor="bg-amber-50 text-amber-600"
+        />
+      </div>
+
+      {/* Viral Analysis Summary section */}
+      <div className="card p-5">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-gray-900">🚀 Viral Analysis Summary</h2>
+          <div className="flex items-center gap-3">
+            <Link to="/viral-analysis/runs" className="text-sm text-primary-600 hover:text-primary-700 hover:underline">
+              View all
+            </Link>
+            <button
+              className="btn-primary"
+              onClick={handleRunAnalysis}
+              disabled={runningAnalysis}
+            >
+              {runningAnalysis ? (
+                <>
+                  <span className="w-3 h-3 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                  Analyzing...
+                </>
+              ) : (
+                <>
+                  <span>▶</span> Run Analysis
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        {latestCompletedRun && topRecommendation ? (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-4 mb-4">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1">
+                <p className="text-xs font-semibold uppercase tracking-wide text-emerald-600">
+                  TOP 1 Recommended Opportunity
+                </p>
+                <h3 className="mt-1 text-lg font-bold text-gray-900">
+                  {topRecommendation.opportunity.topic}
+                </h3>
+                <p className="mt-1 text-sm text-gray-600">
+                  <span className="font-medium">Angle:</span> {topRecommendation.opportunity.angle}
+                </p>
+                <p className="mt-1 text-sm text-gray-600">
+                  <span className="font-medium">Hook:</span> {topRecommendation.opportunity.hook}
+                </p>
+                <p className="mt-1 text-sm text-gray-600">
+                  <span className="font-medium">Audience:</span> {topRecommendation.opportunity.targetAudience ?? '-'}
+                </p>
+              </div>
+              <div className="text-right shrink-0">
+                <div className="inline-flex items-center gap-1.5 rounded-full bg-emerald-100 px-3 py-1">
+                  <span className="text-sm font-bold text-emerald-700">
+                    {topRecommendation.opportunity.opportunityScore.toFixed(0)}
+                  </span>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">Opportunity Score</p>
+                <Link
+                  to={`/viral-analysis/${latestCompletedRun.id}/recommendation`}
+                  className="text-sm text-primary-600 hover:text-primary-700 hover:underline mt-2 block"
+                >
+                  View full recommendation →
+                </Link>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <p className="text-sm text-gray-500 mb-4">
+            No completed viral analysis runs yet. Click "Run Analysis" to generate content opportunities.
+          </p>
+        )}
+
+        <div className="space-y-3">
+          {viralRuns.length === 0 ? (
+            <p className="text-sm text-gray-500">No viral analysis runs.</p>
+          ) : (
+            viralRuns.slice(0, 5).map((run) => (
+              <div key={run.id} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
+                <div>
+                  <p className="text-sm font-medium text-gray-900">
+                    Run #{run.id}{' '}
+                    {run.niche && <span className="text-gray-500">({run.niche})</span>}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    {run.trendKeyword || 'Daily analysis'} · {run.eligibleCandidates}/{run.totalCandidates} candidates · {formatDateTime(run.startedAt)}
+                  </p>
+                </div>
+                <div className="text-right">
+                  <p className="text-xs text-gray-600 font-medium">
+                    {run.opportunitiesGenerated} opportunities
+                  </p>
+                  <StatusBadge status={run.status} />
+                </div>
+              </div>
+            ))
+          )}
+        </div>
       </div>
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">

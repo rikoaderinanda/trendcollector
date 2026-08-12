@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Swashbuckle.AspNetCore.Annotations;
 using Swashbuckle.AspNetCore.Filters;
+using AIContentFactory.Api.Models;
 using AIContentFactory.Api.Models.Dtos;
 using AIContentFactory.Api.Models.Entities;
 using AIContentFactory.Api.Repositories;
@@ -94,28 +95,110 @@ public sealed class TrendController : ControllerBase
     /// <summary>Lists collected videos.</summary>
     /// <param name="language">Optional language filter (e.g. "id").</param>
     /// <param name="date">Optional filter: only videos created on this calendar date (yyyy-MM-dd).</param>
+    /// <param name="sortBy">Optional sort column: published_at, views, likes, comments, favorites, engagement_rate, view_per_day, video_age_days, captured_at, views_per_hour, like_velocity, comment_velocity, or growth_score.</param>
+    /// <param name="sortDirection">Sort direction: "asc" or "desc" (default "desc").</param>
+    /// <param name="minViews">Minimum latest-snapshot views.</param>
+    /// <param name="maxViews">Maximum latest-snapshot views.</param>
+    /// <param name="minLikes">Minimum latest-snapshot likes.</param>
+    /// <param name="maxLikes">Maximum latest-snapshot likes.</param>
+    /// <param name="minComments">Minimum latest-snapshot comments.</param>
+    /// <param name="maxComments">Maximum latest-snapshot comments.</param>
+    /// <param name="minFavorites">Minimum latest-snapshot favorites.</param>
+    /// <param name="maxFavorites">Maximum latest-snapshot favorites.</param>
+    /// <param name="minEngagementRate">Minimum latest-snapshot engagement rate.</param>
+    /// <param name="maxEngagementRate">Maximum latest-snapshot engagement rate.</param>
+    /// <param name="minViewPerDay">Minimum latest-snapshot views per day.</param>
+    /// <param name="maxViewPerDay">Maximum latest-snapshot views per day.</param>
+    /// <param name="minVideoAgeDays">Minimum latest-snapshot video age (days).</param>
+    /// <param name="maxVideoAgeDays">Maximum latest-snapshot video age (days).</param>
+    /// <param name="capturedAfter">Only videos whose latest snapshot was captured at/after this timestamp.</param>
+    /// <param name="capturedBefore">Only videos whose latest snapshot was captured at/before this timestamp.</param>
+    /// <param name="minViewsPerHour">Minimum latest-snapshot views per hour (tracking mode).</param>
+    /// <param name="maxViewsPerHour">Maximum latest-snapshot views per hour (tracking mode).</param>
+    /// <param name="minLikeVelocity">Minimum latest-snapshot like velocity (tracking mode).</param>
+    /// <param name="maxLikeVelocity">Maximum latest-snapshot like velocity (tracking mode).</param>
+    /// <param name="minCommentVelocity">Minimum latest-snapshot comment velocity (tracking mode).</param>
+    /// <param name="maxCommentVelocity">Maximum latest-snapshot comment velocity (tracking mode).</param>
+    /// <param name="minGrowthScore">Minimum latest-snapshot growth score (tracking mode).</param>
+    /// <param name="maxGrowthScore">Maximum latest-snapshot growth score (tracking mode).</param>
     /// <param name="limit">Maximum number of results.</param>
     /// <param name="offset">Number of results to skip.</param>
     /// <param name="cancellationToken">Request cancellation token.</param>
     /// <response code="200">Videos returned.</response>
     [SwaggerOperation(
         Summary = "List collected videos",
-        Description = "Returns collected videos, optionally filtered by language or collection date, with pagination.")]
+        Description =
+            "Returns collected videos, optionally filtered by language, collection date, statistics ranges, and sorting.")]
     [HttpGet("videos")]
-    [ProducesResponseType(typeof(IEnumerable<TrendingVideo>), StatusCodes.Status200OK)]
-    public async Task<ActionResult<IEnumerable<TrendingVideo>>> GetVideos(
+    [ProducesResponseType(typeof(IEnumerable<VideoListItemDto>), StatusCodes.Status200OK)]
+    public async Task<ActionResult<IEnumerable<VideoListItemDto>>> GetVideos(
         [FromQuery] string? language = null,
         [FromQuery] DateTime? date = null,
+        [FromQuery] string? sortBy = null,
+        [FromQuery] string? sortDirection = null,
+        [FromQuery] long? minViews = null,
+        [FromQuery] long? maxViews = null,
+        [FromQuery] long? minLikes = null,
+        [FromQuery] long? maxLikes = null,
+        [FromQuery] long? minComments = null,
+        [FromQuery] long? maxComments = null,
+        [FromQuery] long? minFavorites = null,
+        [FromQuery] long? maxFavorites = null,
+        [FromQuery] decimal? minEngagementRate = null,
+        [FromQuery] decimal? maxEngagementRate = null,
+        [FromQuery] decimal? minViewPerDay = null,
+        [FromQuery] decimal? maxViewPerDay = null,
+        [FromQuery] decimal? minVideoAgeDays = null,
+        [FromQuery] decimal? maxVideoAgeDays = null,
+        [FromQuery] DateTimeOffset? capturedAfter = null,
+        [FromQuery] DateTimeOffset? capturedBefore = null,
+        [FromQuery] decimal? minViewsPerHour = null,
+        [FromQuery] decimal? maxViewsPerHour = null,
+        [FromQuery] decimal? minLikeVelocity = null,
+        [FromQuery] decimal? maxLikeVelocity = null,
+        [FromQuery] decimal? minCommentVelocity = null,
+        [FromQuery] decimal? maxCommentVelocity = null,
+        [FromQuery] decimal? minGrowthScore = null,
+        [FromQuery] decimal? maxGrowthScore = null,
         [FromQuery] int limit = 20,
         [FromQuery] int offset = 0,
         CancellationToken cancellationToken = default)
     {
-        var videos = await _videoRepository.ListAsync(
-            language,
-            date,
-            Math.Clamp(limit, 1, 100),
-            Math.Max(offset, 0),
-            cancellationToken);
+        var query = new VideoListQuery
+        {
+            Language = language,
+            Date = date,
+            SortBy = sortBy,
+            SortDirection = sortDirection,
+            MinViews = minViews,
+            MaxViews = maxViews,
+            MinLikes = minLikes,
+            MaxLikes = maxLikes,
+            MinComments = minComments,
+            MaxComments = maxComments,
+            MinFavorites = minFavorites,
+            MaxFavorites = maxFavorites,
+            MinEngagementRate = minEngagementRate,
+            MaxEngagementRate = maxEngagementRate,
+            MinViewPerDay = minViewPerDay,
+            MaxViewPerDay = maxViewPerDay,
+            MinVideoAgeDays = minVideoAgeDays,
+            MaxVideoAgeDays = maxVideoAgeDays,
+            CapturedAfter = capturedAfter,
+            CapturedBefore = capturedBefore,
+            MinViewsPerHour = minViewsPerHour,
+            MaxViewsPerHour = maxViewsPerHour,
+            MinLikeVelocity = minLikeVelocity,
+            MaxLikeVelocity = maxLikeVelocity,
+            MinCommentVelocity = minCommentVelocity,
+            MaxCommentVelocity = maxCommentVelocity,
+            MinGrowthScore = minGrowthScore,
+            MaxGrowthScore = maxGrowthScore,
+            Limit = limit,
+            Offset = offset,
+        };
+
+        var videos = await _videoRepository.ListWithLatestStatsAsync(query, cancellationToken);
 
         return Ok(videos);
     }

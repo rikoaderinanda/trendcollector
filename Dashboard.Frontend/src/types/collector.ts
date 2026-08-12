@@ -40,6 +40,23 @@ export interface TrendingVideo {
   rawJson?: string;
   createdAt: string;
   updatedAt: string;
+
+  // Latest statistics snapshot (populated by GET /api/trend/videos)
+  views?: number | null;
+  likes?: number | null;
+  comments?: number | null;
+  favorites?: number | null;
+  engagementRate?: number | null;
+  likeRatio?: number | null;
+  commentRatio?: number | null;
+  viewPerDay?: number | null;
+  videoAgeDays?: number | null;
+  statisticsCapturedAt?: string | null;
+  // Tracking Mode velocity metrics
+  viewsPerHour?: number | null;
+  likeVelocity?: number | null;
+  commentVelocity?: number | null;
+  growthScore?: number | null;
 }
 
 export interface VideoStatistics {

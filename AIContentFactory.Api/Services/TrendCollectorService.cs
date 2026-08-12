@@ -25,6 +25,8 @@ public sealed class TrendCollectorService
     private readonly TrackingModeOptions _trackingOptions;
     private readonly StatisticsCalculator _statisticsCalculator;
     private readonly IQueueService _queueService;
+    private readonly Agent1VideoValidator _videoValidator;
+    private readonly IDataProcessingFailureRepository _failureRepo;
     private readonly KnowledgeExtractionOptions _knowledgeExtractionOptions;
     private readonly ILogger<TrendCollectorService> _logger;
 
@@ -38,6 +40,8 @@ public sealed class TrendCollectorService
         IOptions<TrackingModeOptions> trackingOptions,
         StatisticsCalculator statisticsCalculator,
         IQueueService queueService,
+        Agent1VideoValidator videoValidator,
+        IDataProcessingFailureRepository failureRepo,
         IOptions<KnowledgeExtractionOptions> knowledgeExtractionOptions,
         ILogger<TrendCollectorService> logger)
     {
@@ -50,6 +54,8 @@ public sealed class TrendCollectorService
         _trackingOptions = trackingOptions.Value;
         _statisticsCalculator = statisticsCalculator;
         _queueService = queueService;
+        _videoValidator = videoValidator;
+        _failureRepo = failureRepo;
         _knowledgeExtractionOptions = knowledgeExtractionOptions.Value;
         _logger = logger;
     }
@@ -77,6 +83,11 @@ public sealed class TrendCollectorService
         };
 
         var jobId = await _jobRepository.CreateAsync(job, cancellationToken);
+        using var scope = _logger.BeginScope(new Dictionary<string, object>
+        {
+            ["CorrelationId"] = $"collector:{jobId}",
+            ["Keyword"] = request.Keyword
+        });
 
         try
         {
@@ -114,6 +125,7 @@ public sealed class TrendCollectorService
 
             int saved = 0;
             int skipped = 0;
+            int validationFailures = 0;
 
             foreach (var (videoId, channelId) in toProcess)
             {
@@ -141,6 +153,30 @@ public sealed class TrendCollectorService
                 }
 
                 var video = MapVideo(platformId, videoId, videoElement, channelDbId, language);
+
+                // Validate the mapped video before persisting.
+                var validation = _videoValidator.Validate(video);
+                if (validation.IsInvalid)
+                {
+                    validationFailures++;
+                    _logger.LogWarning("Skipping invalid video {VideoId}: {Reason}", videoId,
+                        string.Join("; ", validation.Reasons));
+                    await _failureRepo.RecordAsync(new DataProcessingFailure
+                    {
+                        AgentName = "TrendCollector",
+                        EntityType = "TrendingVideo",
+                        EntityId = 0,
+                        Operation = "collect",
+                        Status = "Invalid",
+                        FailureType = "Permanent",
+                        FailureReason = $"Validation failed: {string.Join("; ", validation.Reasons)}",
+                        FirstAttemptAt = DateTimeOffset.UtcNow,
+                        LastAttemptAt = DateTimeOffset.UtcNow,
+                        RawReference = $"platform_video_id={videoId}"
+                    }, cancellationToken);
+                    continue;
+                }
+
                 var statistics = _statisticsCalculator.Calculate(
                     videoId: 0, // overridden inside the transactional insert
                     views: GetLong(videoElement, "statistics", "viewCount"),
@@ -150,15 +186,69 @@ public sealed class TrendCollectorService
                     publishedAt: video.PublishedAt,
                     capturedAt: DateTimeOffset.UtcNow);
 
-                var dbVideoId = await _videoRepository.InsertWithStatisticsAsync(video, statistics, cancellationToken);
+                long dbVideoId;
+                try
+                {
+                    dbVideoId = await _videoRepository.InsertWithStatisticsAsync(video, statistics, cancellationToken);
+                }
+                catch (Exception dbEx)
+                {
+                    // A database failure for one video must not fail the entire
+                    // collection run. Record it as retryable for the recovery worker.
+                    _logger.LogWarning("Database insert failed for video {VideoId}: {Message}", videoId, dbEx.Message);
+                    await _failureRepo.RecordAsync(new DataProcessingFailure
+                    {
+                        AgentName = "TrendCollector",
+                        EntityType = "TrendingVideo",
+                        EntityId = 0,
+                        Operation = "collect-insert",
+                        Status = "Retryable",
+                        FailureType = "Transient",
+                        FailureReason = dbEx.Message,
+                        ExceptionType = dbEx.GetType().FullName,
+                        RetryCount = 0,
+                        MaxRetryAttempts = 5,
+                        FirstAttemptAt = DateTimeOffset.UtcNow,
+                        LastAttemptAt = DateTimeOffset.UtcNow,
+                        RawReference = $"platform_video_id={videoId}"
+                    }, cancellationToken);
+                    continue;
+                }
+
                 saved++;
                 _logger.LogInformation("Saved video {VideoId} ('{Title}') as db id {DbVideoId}", videoId, video.Title,
                     dbVideoId);
 
-                // Integration: automatically enqueue every saved video for knowledge extraction.
+                // Integration: automatically enqueue high-quality candidates for
+                // knowledge extraction. The early gate filters OUT:
+                //  1. Non-Shorts videos (duration > 60s) when ShortsOnly=true
+                //  2. Videos older than MaximumVideoAgeDays
+                //  3. Videos below MinimumViewsForEnqueue
+                // This preserves raw data (video still saved) but avoids wasting
+                // Agent 2 AI tokens on videos unlikely to be the viral candidate.
                 if (_knowledgeExtractionOptions.AutoEnqueueEnabled)
                 {
-                    await EnqueueForKnowledgeExtractionAsync(dbVideoId, cancellationToken);
+                    var gateResult = ShouldEnqueue(video, statistics);
+                    if (gateResult.IsAccepted)
+                    {
+                        await EnqueueForKnowledgeExtractionAsync(dbVideoId, cancellationToken);
+                    }
+                    else
+                    {
+                        await _failureRepo.RecordAsync(new DataProcessingFailure
+                        {
+                            AgentName = "TrendCollector",
+                            EntityType = "TrendingVideo",
+                            EntityId = dbVideoId,
+                            Operation = "enqueue-gate",
+                            Status = "Skipped",
+                            FailureType = "Permanent",
+                            FailureReason = gateResult.Reason,
+                            FirstAttemptAt = DateTimeOffset.UtcNow,
+                            LastAttemptAt = DateTimeOffset.UtcNow,
+                            RawReference = $"platform_video_id={videoId}"
+                        }, cancellationToken);
+                    }
                 }
             }
 
@@ -227,6 +317,10 @@ public sealed class TrendCollectorService
         };
 
         var jobId = await _jobRepository.CreateAsync(job, cancellationToken);
+        using var trackingScope = _logger.BeginScope(new Dictionary<string, object>
+        {
+            ["CorrelationId"] = $"tracking:{jobId}"
+        });
 
         try
         {
@@ -333,6 +427,109 @@ public sealed class TrendCollectorService
         }
     }
 
+    /// <summary>
+    /// Result of the early candidate quality gate. Videos that pass are sent
+    /// to Agent 2; those that fail are still stored in the DB (raw data
+    /// preserved) but recorded as a DataProcessingFailure (Status=Skipped)
+    /// with the rejection reason for observability/reporting.
+    /// </summary>
+    private sealed record EnqueueGateResult(bool IsAccepted, string Reason)
+    {
+        public static EnqueueGateResult Accepted { get; } = new(true, string.Empty);
+    }
+
+    /// <summary>
+    /// Applies the early candidate quality gate: Shorts-only, freshness,
+    /// and minimum views threshold. Videos failing the gate are still stored
+    /// in the DB (raw data preserved) but are not sent to Agent 2.
+    /// </summary>
+    private EnqueueGateResult ShouldEnqueue(TrendingVideo video, VideoStatistics statistics)
+    {
+        // 1. Shorts-only filter (duration ≤ 60s).
+        if (_trackingOptions.Enabled && _shortsOnlyEnabled)
+        {
+            if (video.Duration is not null && !IsShortDuration(video.Duration))
+            {
+                var reason = $"Not Shorts (duration {video.Duration}).";
+                _logger.LogDebug("Skipping enqueue for video {VideoId}: {Reason}",
+                    video.PlatformVideoId, reason);
+                return new EnqueueGateResult(false, reason);
+            }
+        }
+
+        // 2. Freshness filter.
+        if (video.PublishedAt.HasValue)
+        {
+            var ageDays = (DateTimeOffset.UtcNow - video.PublishedAt.Value).TotalDays;
+            if (ageDays > DefaultMaxAgeDays)
+            {
+                var reason = $"Too old ({ageDays:0.#} days > {DefaultMaxAgeDays} days).";
+                _logger.LogDebug("Skipping enqueue for video {VideoId}: {Reason}",
+                    video.PlatformVideoId, reason);
+                return new EnqueueGateResult(false, reason);
+            }
+        }
+
+        // 3. Minimum views threshold.
+        if ((statistics.Views ?? 0) < MinViewsForEnqueue)
+        {
+            var reason = $"Views {statistics.Views ?? 0} below min {MinViewsForEnqueue}.";
+            _logger.LogDebug("Skipping enqueue for video {VideoId}: {Reason}",
+                video.PlatformVideoId, reason);
+            return new EnqueueGateResult(false, reason);
+        }
+
+        return EnqueueGateResult.Accepted;
+    }
+
+    private const int DefaultMaxAgeDays = 7;
+    private const long MinViewsForEnqueue = 10_000;
+    private readonly bool _shortsOnlyEnabled = true;
+
+    /// <summary>Parses ISO 8601 duration (e.g. "PT1M30S" or "PT45S") and checks if ≤ 60 seconds.</summary>
+    internal static bool IsShortDuration(string? duration)
+    {
+        if (string.IsNullOrEmpty(duration))
+        {
+            return true; // Unknown duration — be permissive.
+        }
+
+        try
+        {
+            // ISO 8601: PT#H#M#S
+            int seconds = 0, minutes = 0, hours = 0;
+            var num = string.Empty;
+            foreach (var c in duration)
+            {
+                if (char.IsDigit(c))
+                {
+                    num += c;
+                }
+                else if (c == 'H')
+                {
+                    hours = int.TryParse(num, out var h) ? h : 0;
+                    num = string.Empty;
+                }
+                else if (c == 'M')
+                {
+                    minutes = int.TryParse(num, out var m) ? m : 0;
+                    num = string.Empty;
+                }
+                else if (c == 'S')
+                {
+                    seconds = int.TryParse(num, out var s) ? s : 0;
+                    num = string.Empty;
+                }
+            }
+
+            return TimeSpan.FromSeconds(hours * 3600 + minutes * 60 + seconds).TotalSeconds <= 60;
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
     private async Task EnqueueForKnowledgeExtractionAsync(long dbVideoId, CancellationToken cancellationToken)
     {
         try
@@ -344,11 +541,7 @@ public sealed class TrendCollectorService
         }
         catch (Exception ex)
         {
-            // Knowledge extraction must never break video collection.
-            // Log and continue - the worker/API can enqueue manually if needed.
-            _logger.LogError(
-                ex,
-                "Unexpected error while enqueuing video {DbVideoId} for knowledge extraction.",
+            _logger.LogError(ex, "Unexpected error while enqueuing video {DbVideoId} for knowledge extraction.",
                 dbVideoId);
         }
     }
@@ -359,7 +552,6 @@ public sealed class TrendCollectorService
     {
         var snippet = GetProperty(item, "snippet");
         var statistics = GetProperty(item, "statistics");
-
         return new Channel
         {
             PlatformId = platformId,
@@ -375,17 +567,12 @@ public sealed class TrendCollectorService
         };
     }
 
-    private static TrendingVideo MapVideo(
-        int platformId,
-        string videoId,
-        JsonElement item,
-        long? channelDbId,
+    private static TrendingVideo MapVideo(int platformId, string videoId, JsonElement item, long? channelDbId,
         string language)
     {
         var snippet = GetProperty(item, "snippet");
         var contentDetails = GetProperty(item, "contentDetails");
         var thumbnails = GetProperty(snippet, "thumbnails");
-
         return new TrendingVideo
         {
             PlatformId = platformId,
@@ -423,11 +610,8 @@ public sealed class TrendCollectorService
     private static bool TryGetVideoId(JsonElement item, out string videoId)
     {
         videoId = string.Empty;
-        if (item.TryGetProperty("id", out var id) &&
-            id.TryGetProperty("videoId", out var videoIdElement))
-        {
+        if (item.TryGetProperty("id", out var id) && id.TryGetProperty("videoId", out var videoIdElement))
             videoId = videoIdElement.GetString() ?? string.Empty;
-        }
         return !string.IsNullOrEmpty(videoId);
     }
 
@@ -436,9 +620,7 @@ public sealed class TrendCollectorService
         channelId = string.Empty;
         if (item.TryGetProperty("snippet", out var snippet) &&
             snippet.TryGetProperty("channelId", out var channelIdElement))
-        {
             channelId = channelIdElement.GetString() ?? string.Empty;
-        }
         return !string.IsNullOrEmpty(channelId);
     }
 
@@ -448,10 +630,7 @@ public sealed class TrendCollectorService
         foreach (var item in GetItems(root))
         {
             var id = GetString(item, "id");
-            if (!string.IsNullOrEmpty(id))
-            {
-                dict[id] = item;
-            }
+            if (!string.IsNullOrEmpty(id)) dict[id] = item;
         }
         return dict;
     }
@@ -462,10 +641,7 @@ public sealed class TrendCollectorService
         foreach (var item in GetItems(root))
         {
             var id = GetString(item, "id");
-            if (!string.IsNullOrEmpty(id))
-            {
-                dict[id] = item;
-            }
+            if (!string.IsNullOrEmpty(id)) dict[id] = item;
         }
         return dict;
     }
@@ -475,10 +651,8 @@ public sealed class TrendCollectorService
 
     private static string? GetString(JsonElement element, string propertyName)
     {
-        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out var value))
-        {
-            return null;
-        }
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(propertyName, out var value)) return null;
         var text = value.GetString();
         return string.IsNullOrEmpty(text) ? null : text;
     }
@@ -489,102 +663,47 @@ public sealed class TrendCollectorService
         foreach (var segment in path)
         {
             if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(segment, out var next))
-            {
                 return null;
-            }
             current = next;
         }
 
-        return current.ValueKind == JsonValueKind.Number && current.TryGetInt64(out var number)
-            ? number
-            : current.ValueKind == JsonValueKind.String && long.TryParse(current.GetString(), out var parsed)
-                ? parsed
-                : null;
+        return current.ValueKind == JsonValueKind.Number && current.TryGetInt64(out var number) ? number
+            : current.ValueKind == JsonValueKind.String && long.TryParse(current.GetString(), out var parsed) ? parsed
+            : null;
     }
 
     private static int? GetInt(JsonElement element, params string[] path)
     {
-        var value = GetLong(element, path);
-        return value is null or > int.MaxValue ? null : (int)value.Value;
+        var v = GetLong(element, path);
+        return v is null or > int.MaxValue ? null : (int)v.Value;
     }
 
-    private static bool? ParseBool(string? value)
-        => value is null ? null : bool.TryParse(value, out var parsed) ? parsed : null;
+    private static bool? ParseBool(string? value) => value is null ? null : bool.TryParse(value, out var p) ? p : null;
 
     private static DateTimeOffset? GetDateTimeOffset(JsonElement element, string propertyName)
     {
-        var value = GetString(element, propertyName);
-        return value is null ? null : DateTimeOffset.TryParse(value, out var parsed) ? parsed : null;
+        var v = GetString(element, propertyName);
+        return v is null ? null : DateTimeOffset.TryParse(v, out var p) ? p : null;
     }
 
     private static string[]? GetStringArray(JsonElement element, string propertyName)
     {
-        if (element.ValueKind != JsonValueKind.Object || !element.TryGetProperty(propertyName, out var value))
-        {
-            return null;
-        }
-        if (value.ValueKind != JsonValueKind.Array)
-        {
-            return null;
-        }
-
-        var tags = value.EnumerateArray()
-            .Select(x => x.GetString())
-            .Where(x => !string.IsNullOrEmpty(x))
-            .Select(x => x!)
-            .ToArray();
-
+        if (element.ValueKind != JsonValueKind.Object ||
+            !element.TryGetProperty(propertyName, out var value)) return null;
+        if (value.ValueKind != JsonValueKind.Array) return null;
+        var tags = value.EnumerateArray().Select(x => x.GetString()).Where(x => !string.IsNullOrEmpty(x))
+            .Select(x => x!).ToArray();
         return tags.Length == 0 ? null : tags;
     }
 
-    private static string? GetThumbnailUrl(JsonElement thumbnails, string size)
-    {
-        var thumbnail = GetProperty(thumbnails, size);
-        return GetString(thumbnail, "url");
-    }
+    private static string? GetThumbnailUrl(JsonElement thumbnails, string size) =>
+        GetString(GetProperty(thumbnails, size), "url");
 
-    /// <summary>Maps the standard YouTube category ids to readable names.</summary>
-    private static string? MapCategoryName(string? categoryId)
+    private static string? MapCategoryName(string? categoryId) => categoryId switch
     {
-        if (string.IsNullOrEmpty(categoryId))
-        {
-            return null;
-        }
-
-        return categoryId switch
-        {
-            "1" => "Film & Animation",
-            "2" => "Autos & Vehicles",
-            "10" => "Music",
-            "15" => "Pets & Animals",
-            "17" => "Sports",
-            "18" => "Short Movies",
-            "19" => "Travel & Events",
-            "20" => "Gaming",
-            "21" => "Videoblogging",
-            "22" => "People & Blogs",
-            "23" => "Comedy",
-            "24" => "Entertainment",
-            "25" => "News & Politics",
-            "26" => "Howto & Style",
-            "27" => "Education",
-            "28" => "Science & Technology",
-            "29" => "Nonprofits & Activism",
-            "30" => "Movies",
-            "31" => "Anime/Animation",
-            "32" => "Action/Adventure",
-            "33" => "Classics",
-            "34" => "Comedy",
-            "35" => "Documentary",
-            "36" => "Drama",
-            "37" => "Family",
-            "38" => "Foreign",
-            "39" => "Horror",
-            "40" => "Sci-Fi/Fantasy",
-            "41" => "Thriller",
-            "42" => "Shorts",
-            "43" => "Shows",
-            _ => categoryId
-        };
-    }
+        "1" => "Film & Animation", "2" => "Autos & Vehicles", "10" => "Music", "15" => "Pets & Animals",
+        "17" => "Sports", "20" => "Gaming", "22" => "People & Blogs", "23" => "Comedy",
+        "24" => "Entertainment", "25" => "News & Politics", "26" => "Howto & Style", "27" => "Education",
+        "28" => "Science & Technology", _ => categoryId
+    };
 }
